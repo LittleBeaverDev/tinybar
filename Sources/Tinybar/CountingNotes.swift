@@ -21,8 +21,8 @@ struct CountingNotes: View {
             note("Tokens", """
                 Counted from the Claude Code and Codex logs and OpenCode's database on this Mac, and \
                 kept as daily totals, so they stay when old logs are deleted. Of OpenCode, only use \
-                of its Go subscription counts. Cursor activity is synced from its Dashboard API \
-                using the Cursor app login, initially for the last 30 days.
+                of its Go subscription counts. If opted in via Cursor settings, Cursor activity is \
+                synced from its Dashboard API using the Cursor app login, initially for the last 30 days.
                 """)
             note("At API prices", """
                 What those tokens would cost on each provider's pay-as-you-go API, at today's prices \
@@ -43,8 +43,9 @@ struct CountingNotes: View {
             note("Your data", """
                 Logs, totals and stats stay on this Mac. Of shell commands, Tinybar keeps only the \
                 names of the programs they run; of edited files, only the extension. It only asks \
-                each provider for your limits, Cursor for usage events, their status pages for outages, models.dev for \
-                prices and GitHub for new versions of Tinybar.
+                each provider for your limits, Cursor Dashboard for usage events only if opted in via \
+                Cursor settings, their status pages for outages, models.dev for prices and GitHub for \
+                new versions of Tinybar.
                 """)
         }
         .frame(maxWidth: .infinity, alignment: .leading)

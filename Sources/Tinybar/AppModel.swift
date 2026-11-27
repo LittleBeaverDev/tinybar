@@ -65,6 +65,8 @@ final class AppModel {
     var isRefreshing: Bool { isFetching || usageTask != nil }
     private var isFetching = false
     private var usageTask: Task<Void, Never>?
+    private var cursorUsageTask: Task<Void, Never>?
+    private var pendingUsageRefresh = false
 
     let settings: Settings
     let updater = Updater()
@@ -287,14 +289,31 @@ final class AppModel {
             notifier.send(update: release)
         }
         guard !isAsleep, !isLocked else { return nil }
-        if usageTask == nil {
-            usageTask = Task {
+        startUsageRefresh()
+        return usageTask
+    }
+
+    private func startUsageRefresh() {
+        guard usageTask == nil else { return }
+        usageTask = Task {
+            repeat {
+                pendingUsageRefresh = false
                 await refreshUsage()
                 lastUpdated = Date()
-                usageTask = nil
-            }
+            } while pendingUsageRefresh
+            usageTask = nil
         }
-        return usageTask
+    }
+
+    func setCursorRemoteUsage(_ enabled: Bool) {
+        guard settings.cursorRemoteUsage != enabled else { return }
+        settings.cursorRemoteUsage = enabled
+        if enabled {
+            if usageTask != nil { pendingUsageRefresh = true }
+            else { startUsageRefresh() }
+        } else {
+            cursorUsageTask?.cancel()
+        }
     }
 
     /// Reads the status pages of the enabled subscriptions that have one. A page that can't be
@@ -559,8 +578,12 @@ final class AppModel {
         }
 
         guard !isAsleep, !isLocked else { return }
-        if enabledProviders.contains(.cursor), let token = try? CursorProvider.activityAccessToken() {
-            try? await store.syncCursorUsage(accessToken: token)
+        if enabledProviders.contains(.cursor), settings.cursorRemoteUsage,
+           let token = try? CursorProvider.activityAccessToken() {
+            let task = Task<Void, Never> { try? await store.syncCursorUsage(accessToken: token) }
+            cursorUsageTask = task
+            await task.value
+            cursorUsageTask = nil
         }
         prices = await pricing.refreshIfNeeded()
         guard !isAsleep, !isLocked else { return }
@@ -813,6 +836,7 @@ final class AppModel {
             if isFetching { pendingRefreshThrottle = pendingRefreshThrottle ?? Self.openThrottle }
             else { Task { await refresh(force: false, throttle: Self.openThrottle) } }
         } else if let state = providers.removeValue(forKey: id) {
+            if id == .cursor { cursorUsageTask?.cancel() }
             disabledProviders[id] = state
         }
     }

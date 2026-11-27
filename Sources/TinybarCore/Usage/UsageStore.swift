@@ -768,7 +768,9 @@ public actor UsageStore {
         var page = 1
         var count = 0
         while true {
+            try Task.checkCancellation()
             let response = try await fetch(start, end, page)
+            try Task.checkCancellation()
             let events = response.usageEventsDisplay ?? []
             try db.transaction {
                 var stats = StatBatch()
@@ -792,6 +794,7 @@ public actor UsageStore {
             if events.isEmpty || (response.totalUsageEventsCount.map { count >= $0 } ?? (events.count < 200)) { break }
             page += 1
         }
+        try Task.checkCancellation()
         try db.run("INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)", [.text(key), .text(String(end))])
     }
 

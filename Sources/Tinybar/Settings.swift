@@ -38,6 +38,11 @@ final class Settings {
         }
     }
 
+    /// Remote Cursor usage history is opt-in.
+    var cursorRemoteUsage: Bool {
+        didSet { if savesChanges { defaults.set(cursorRemoteUsage, forKey: "usage.cursor.remote") } }
+    }
+
     var claudeSwapHintDismissed: Bool {
         didSet { if savesChanges { defaults.set(claudeSwapHintDismissed, forKey: "claudeSwapHintDismissed") } }
     }
@@ -66,6 +71,7 @@ final class Settings {
         showsUsedPercentage = defaults.bool(forKey: "showsUsedPercentage")
         notificationsEnabled = defaults.bool(forKey: "notificationsEnabled")
         readClaudeSwap = defaults.bool(forKey: "readClaudeSwap")
+        cursorRemoteUsage = defaults.bool(forKey: "usage.cursor.remote")
         claudeSwapHintDismissed = defaults.bool(forKey: "claudeSwapHintDismissed")
         quietIncidents = QuietIncidents(defaults.dictionary(forKey: "quietIncidents") as? [String: Int] ?? [:])
         loginFoldersOff = Set(defaults.stringArray(forKey: "loginFoldersOff") ?? [])

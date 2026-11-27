@@ -1352,6 +1352,15 @@ private struct SubscriptionPage: View {
                     Text("Show \(id.displayName)")
                 }
             }
+            if id == .cursor {
+                SettingsSection("Usage history", footer: "Uses the Cursor app login to fetch usage events for Usage & Stats. Turning this off keeps imported history and does not affect Cursor limits.") {
+                    SettingsToggle(isOn: Binding(
+                        get: { settings.cursorRemoteUsage },
+                        set: { model.setCursorRemoteUsage($0) }), first: true) {
+                        Text("Sync Cursor usage history")
+                    }
+                }
+            }
             if LoginFolderKind.of(id) != nil {
                 AccountsSection(model: model, id: id)
             }
