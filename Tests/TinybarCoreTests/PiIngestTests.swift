@@ -84,7 +84,7 @@ private func piMessage(_ id: String, _ provider: String, input: Int = 10) -> Str
     let db = try SQLiteDB(path: f.database.path)
     try db.exec("DROP TABLE pi_message; PRAGMA user_version = 9; INSERT INTO daily_usage VALUES ('2025-01-01', 'codex', 'old', '', 7, 0, 0, 0);")
     let migrated = try UsageStore(path: f.database)
-    #expect(try db.run("PRAGMA user_version").first?.first?.int == 10)
+    #expect(try db.run("PRAGMA user_version").first?.first?.int == 11)
     try f.write(piSession + piMessage("a", "opencode"))
     try await migrated.ingestPi(roots: [f.sessions])
     let rows = try await migrated.daily(since: "0000")

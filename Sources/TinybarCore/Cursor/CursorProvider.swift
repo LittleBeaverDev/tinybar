@@ -29,6 +29,12 @@ public struct CursorProvider: UsageProvider {
         self.cache = cache
     }
 
+    /// Resolve the app login for the remote activity endpoint.
+    public static func activityAccessToken() throws -> String? {
+        guard let stored = CursorAppAuth.storedAccessToken() else { return nil }
+        return try CursorAppAuth.resolve(stored)
+    }
+
     /// Auto-enabled only when Cursor.app holds a login; the browser path is opt-in via Settings.
     public func isConfigured() -> Bool {
         storedToken() != nil

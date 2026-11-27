@@ -37,7 +37,7 @@ public struct DailyStat: Sendable, Hashable {
 public actor UsageStore {
     private let db: SQLiteDB
     private let projects = ProjectResolver()
-    private static let schemaVersion: Int64 = 10
+    private static let schemaVersion: Int64 = 11
 
     public init(path: URL = Paths.appSupport.appendingPathComponent("usage.sqlite")) throws {
         let db = try SQLiteDB(path: path.path)
@@ -52,9 +52,14 @@ public actor UsageStore {
     private static func migrate(_ db: SQLiteDB) throws {
         let version = try db.run("PRAGMA user_version").first?.first?.int ?? 0
         guard version < schemaVersion else { return }
+        try db.exec("CREATE TABLE IF NOT EXISTS cursor_usage_event (id TEXT PRIMARY KEY, timestamp_ms INTEGER NOT NULL) WITHOUT ROWID;")
+        if version == 10 {
+            try db.exec("PRAGMA user_version = 11;")
+            return
+        }
         try db.exec("CREATE TABLE IF NOT EXISTS pi_message (id TEXT PRIMARY KEY, day TEXT NOT NULL, provider TEXT NOT NULL, model TEXT NOT NULL, context INTEGER NOT NULL) WITHOUT ROWID;")
         if version == 9 {
-            try db.exec("PRAGMA user_version = 10;")
+            try db.exec("PRAGMA user_version = 11;")
             return
         }
         if version == 7 || version == 8 {
@@ -239,16 +244,18 @@ public actor UsageStore {
 
     public static var claudeRoots: [URL] { Paths.claudeLogRoots() }
     public static var piRoots: [URL] { Paths.piLogRoots() }
-    public static var logRoots: [URL] { codexRoots + claudeRoots + piRoots }
+    public static var geminiRoots: [URL] { [Paths.agyBrain()] }
+    public static var logRoots: [URL] { codexRoots + claudeRoots + piRoots + geminiRoots }
 
     public enum LogSource: String, Sendable, CaseIterable {
-        case codex, claude, pi
+        case codex, claude, pi, gemini
 
         public var roots: [URL] {
             switch self {
             case .codex: UsageStore.codexRoots
             case .claude: UsageStore.claudeRoots
             case .pi: UsageStore.piRoots
+            case .gemini: UsageStore.geminiRoots
             }
         }
     }
@@ -295,6 +302,12 @@ public actor UsageStore {
     public func ingestPi(roots: [URL] = UsageStore.piRoots, only: Set<String>? = nil,
                          progress: (@Sendable (IngestProgress) -> Void)? = nil) throws -> IngestResult {
         try ingest(.pi, roots: roots, only: only, progress: progress)
+    }
+
+    @discardableResult
+    public func ingestGemini(roots: [URL] = UsageStore.geminiRoots, only: Set<String>? = nil,
+                             progress: (@Sendable (IngestProgress) -> Void)? = nil) throws -> IngestResult {
+        try ingest(.gemini, roots: roots, only: only, progress: progress)
     }
 
     /// OpenCode's database and WAL at the last good read, to skip reading them unchanged.
@@ -377,12 +390,15 @@ public actor UsageStore {
         var changed: [(String, FileStamp)] = []
         if let only {
             let rootPaths = roots.map { $0.path + "/" }
-            for path in only where Self.acceptsLog(path, source: source) && rootPaths.contains(where: path.hasPrefix) {
+            for path in only where Self.acceptsLog(path, source: source) && rootPaths.contains(where: { prefix in
+                path.hasPrefix(prefix) && (source != .gemini || path.dropFirst(prefix.count).split(separator: "/").count == 4)
+            }) {
                 if let stamp = Self.stamp(path), try isChanged(path, stamp) { changed.append((path, stamp)) }
             }
         } else {
             for root in roots {
                 try Self.walkJSONL(root.path, source: source) { path, stamp in
+                    if source == .gemini && path.dropFirst(root.path.count + 1).split(separator: "/").count != 4 { return }
                     if try isChanged(path, stamp) { changed.append((path, stamp)) }
                 }
             }
@@ -400,6 +416,12 @@ public actor UsageStore {
         var index = 0
         while index < changed.count {
             let batch = changed[index..<min(index + batchSize, changed.count)]
+            var maps: [String: AgyProjectMap] = [:]
+            if source == .gemini {
+                for root in roots {
+                    maps[root.path] = AgyProjectMap(database: root.deletingLastPathComponent().appendingPathComponent("conversation_summaries.db"), resolver: projects)
+                }
+            }
             try db.transaction {
                 for (path, stamp) in batch {
                     try db.exec("SAVEPOINT ingest_file")
@@ -412,6 +434,10 @@ public actor UsageStore {
                             case .codex: return try ingestCodexFile(path: path, stamp: stamp, cursor: cursor, mode: .incremental)
                             case .claude: return try ingestClaudeFile(path: path, stamp: stamp, cursor: cursor, mode: .incremental)
                             case .pi: return try ingestPiFile(path: path, stamp: stamp, cursor: cursor)
+                            case .gemini:
+                                let root = roots.first { path.hasPrefix($0.path + "/") }
+                                let id = root.map { String(path.dropFirst($0.path.count + 1)).components(separatedBy: "/").first ?? "" } ?? ""
+                                return try ingestGeminiFile(path: path, stamp: stamp, cursor: cursor, project: root.flatMap { maps[$0.path]?.projects[id] } ?? ProjectResolver.noProject)
                             }
                         }
                         try db.exec("RELEASE ingest_file")
@@ -514,6 +540,32 @@ public actor UsageStore {
             try saveCursor(path: path, source: .codex, stamp: stamp, offset: endOffset, state: state)
         }
         return (endOffset - offset, added)
+    }
+
+    private func ingestGeminiFile(path: String, stamp: FileStamp, cursor: Cursor?, project: String) throws -> (Int64, Int) {
+        var offset: Int64 = 0
+        if let cursor, cursor.stamp.inode == stamp.inode, stamp.size >= cursor.stamp.size {
+            offset = cursor.offset
+        }
+        let parser = AgyLogParser()
+        var entries: [AgyLogParser.Entry] = []
+        let end = try JSONLReader.forEachLine(url: URL(fileURLWithPath: path), from: offset) { line in
+            if let entry = parser.consume(line: line) { entries.append(entry) }
+        }
+        var stats = StatBatch()
+        for entry in entries {
+            let r = entry.record, day = DayKey.string(for: r.timestamp)
+            try addTokens(day: day, provider: .gemini, model: r.model, project: project, r.tokens)
+            stats.addResponse(day: day, provider: .gemini, model: r.model, at: r.timestamp, tokens: r.tokens)
+            for tool in entry.tools {
+                var values = tool.commandStats
+                values[StatKey.tool(tool.name), default: 0] += 1
+                stats.add(StatEvent(timestamp: r.timestamp, values: values), provider: .gemini, model: r.model)
+            }
+        }
+        try write(stats)
+        try saveCursor(path: path, source: .gemini, stamp: stamp, offset: end, state: nil)
+        return (end - offset, entries.count)
     }
 
     private func ingestPiFile(path: String, stamp: FileStamp, cursor: Cursor?) throws -> (Int64, Int) {
@@ -703,6 +755,52 @@ public actor UsageStore {
         return true
     }
 
+    /// Imports remote Cursor activity. The watermark is committed only after every page succeeds.
+    public func syncCursorUsage(accessToken: String, now: Date = Date(),
+        fetch: @Sendable (Int64, Int64, Int) async throws -> CursorUsageEventsAPI.Response) async throws {
+        guard let sub = CursorAppAuth.jwtPayload(accessToken)?["sub"] as? String, !sub.isEmpty else {
+            throw ProviderError.notConfigured
+        }
+        let key = "cursor_usage_watermark:" + sub
+        let end = now.millis
+        let saved = try db.run("SELECT value FROM meta WHERE key = ?", [.text(key)]).first?.first?.text.flatMap(Int64.init)
+        let start = min(end, saved.map { $0 - 86_400_000 } ?? (end - 30 * 86_400_000))
+        var page = 1
+        var count = 0
+        while true {
+            let response = try await fetch(start, end, page)
+            let events = response.usageEventsDisplay ?? []
+            try db.transaction {
+                var stats = StatBatch()
+                for event in events {
+                    guard let id = event.usageEventId, !id.isEmpty, let timestamp = event.timestamp,
+                          timestamp.count == 13, let ms = Int64(timestamp) else { continue }
+                    try db.run("INSERT OR IGNORE INTO cursor_usage_event (id, timestamp_ms) VALUES (?, ?)", [.text(id), .int(ms)])
+                    guard db.changes > 0, let usage = event.tokenUsage else { continue }
+                    let tokens = TokenCounts(input: usage.inputTokens ?? 0, output: usage.outputTokens ?? 0,
+                                             cacheWrite: usage.cacheWriteTokens ?? 0, cacheRead: usage.cacheReadTokens ?? 0)
+                    guard tokens.total > 0 else { continue }
+                    let date = Date(timeIntervalSince1970: Double(ms) / 1000)
+                    let day = DayKey.string(for: date)
+                    let model = ModelName.normalize(event.model ?? "unknown")
+                    try addTokens(day: day, provider: .cursor, model: model, project: ProjectResolver.noProject, tokens)
+                    stats.addResponse(day: day, provider: .cursor, model: model, at: date, tokens: tokens)
+                }
+                try write(stats)
+            }
+            count += events.count
+            if events.isEmpty || (response.totalUsageEventsCount.map { count >= $0 } ?? (events.count < 200)) { break }
+            page += 1
+        }
+        try db.run("INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)", [.text(key), .text(String(end))])
+    }
+
+    public func syncCursorUsage(accessToken: String, now: Date = Date()) async throws {
+        try await syncCursorUsage(accessToken: accessToken, now: now) { start, end, page in
+            try await CursorUsageEventsAPI.fetch(accessToken: accessToken, startDate: start, endDate: end, page: page)
+        }
+    }
+
     // MARK: Activity stats
 
     private func write(_ batch: StatBatch) throws {
@@ -733,7 +831,7 @@ public actor UsageStore {
         SELECT path, provider, CAST(meta.value AS INTEGER) FROM file_cursor
         JOIN meta ON meta.key = 'stats_backfill_limit:' || path ORDER BY path
         """).compactMap { r -> (String, LogSource, Int64)? in
-            guard let path = r[0].text, let source = r[1].text.flatMap(LogSource.init(rawValue:)), source != .pi else { return nil }
+            guard let path = r[0].text, let source = r[1].text.flatMap(LogSource.init(rawValue:)), (source == .codex || source == .claude) else { return nil }
             return (path, source, r[2].int)
         }
         var result = IngestResult(filesScanned: 0, bytesRead: 0, recordsAdded: 0)
@@ -758,7 +856,7 @@ public actor UsageStore {
                             switch source {
                             case .codex: try ingestCodexFile(path: path, stamp: stamp, cursor: cursor, mode: .backfill, limit: limit)
                             case .claude: try ingestClaudeFile(path: path, stamp: stamp, cursor: cursor, mode: .backfill, limit: limit)
-                            case .pi: (0, 0) // pi is never part of a legacy backfill
+                            case .pi, .gemini: (0, 0) // never part of a legacy backfill
                             }
                         }
                     } catch let error as ZstdReader.Failure {
@@ -1091,7 +1189,7 @@ public actor UsageStore {
 
     /// Log folders no import has read yet. A login folder or `cswap run` profile that appears can hold
     /// a whole history, so the app reads those in a child process, not during a normal ingest.
-    public func unreadLogRoots(_ roots: [URL] = UsageStore.codexRoots + UsageStore.claudeRoots) throws -> [URL] {
+    public func unreadLogRoots(_ roots: [URL] = UsageStore.codexRoots + UsageStore.claudeRoots + UsageStore.geminiRoots.filter { FileManager.default.fileExists(atPath: $0.path) }) throws -> [URL] {
         let read = try readLogRoots()
         return roots.filter { !read.contains($0.path) }
     }
@@ -1219,7 +1317,8 @@ public actor UsageStore {
         defer { fts_close(fts) }
         while let entry = fts_read(fts) {
             let info = Int32(entry.pointee.fts_info)
-            if info == FTS_D, entry.pointee.fts_level > 0, String(cString: entry.pointee.fts_accpath).split(separator: "/").last?.hasPrefix(".") == true {  // skip hidden dirs
+            if info == FTS_D, entry.pointee.fts_level > 0, String(cString: entry.pointee.fts_accpath).split(separator: "/").last?.hasPrefix(".") == true,
+               !(source == .gemini && String(cString: entry.pointee.fts_accpath).split(separator: "/").last == ".system_generated") {  // skip hidden dirs
                 fts_set(fts, entry, FTS_SKIP)
                 continue
             }
@@ -1231,7 +1330,13 @@ public actor UsageStore {
     }
 
     static func acceptsLog(_ path: String, source: LogSource) -> Bool {
-        path.hasSuffix(".jsonl") || (source == .codex && (path as NSString).lastPathComponent.hasPrefix("rollout-") && path.hasSuffix(".jsonl.zst"))
+        if source == .gemini {
+            let parts = path.split(separator: "/")
+            return parts.count >= 5 && parts.suffix(3).elementsEqual([".system_generated", "logs", "transcript.jsonl"])
+                && !parts[parts.count - 4].hasPrefix(".")
+        }
+        if path.split(separator: "/").contains(".system_generated") { return false }
+        return path.hasSuffix(".jsonl") || (source == .codex && (path as NSString).lastPathComponent.hasPrefix("rollout-") && path.hasSuffix(".jsonl.zst"))
     }
 
     static func stamp(_ path: String) -> FileStamp? {
