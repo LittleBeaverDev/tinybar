@@ -52,6 +52,7 @@ public struct PiLogParser: Sendable, Codable {
         let read = count("cacheRead"), write = count("cacheWrite"), reasoning = count("reasoning")
         let separateReasoning = reasoning > 0 && count("totalTokens") == input + output + read + write + reasoning
         let tokens = TokenCounts(input: input, output: output + (separateReasoning ? reasoning : 0), cacheWrite: write, cacheRead: read)
+        guard tokens.total > 0 else { return nil }
         let tools = (message["content"] as? [[String: Any]] ?? []).compactMap { block -> Tool? in
             guard block["type"] as? String == "toolCall", let name = block["name"] as? String else { return nil }
             let normalized = name == "bash" ? "Bash" : name

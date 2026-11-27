@@ -15,5 +15,6 @@ import Testing
     #expect(entry.tools.first?.name == "Bash")
     #expect(entry.tools.first?.commandStats.isEmpty == false)
     #expect(consume(#"{"type":"message","id":"u","message":{"role":"user"}}"#) == nil)
+    #expect(consume(#"{"type":"message","id":"e","timestamp":"2025-01-02T12:01:00Z","message":{"role":"assistant","provider":"xai","model":"grok-4.7","stopReason":"error","usage":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"totalTokens":0}}}"#) == nil)
     #expect(consume("not json") == nil)
 }
