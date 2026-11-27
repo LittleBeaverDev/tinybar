@@ -1,5 +1,6 @@
 import CommonCrypto
 import Foundation
+import Darwin
 import SQLite3
 
 /// Reads session cookies from local browsers for the opt-in browser fallback (SPEC §4).
@@ -143,19 +144,13 @@ public enum BrowserCookies {
         Dictionary(rows.map { ($0.name, $0.value) }, uniquingKeysWith: { a, _ in a })
     }
 
-    /// Cached per browser for the app's lifetime, so macOS asks at most once per launch
-    /// (and never again after "Always Allow").
-    nonisolated(unsafe) private static var keyCache: [String: Data] = [:]
-    private static let keyLock = NSLock()
-
     static func decrypt(_ rows: [Row], browser: Browser, db: URL) -> [String: String]? {
         guard let key = key(for: browser) else { return nil }
         let stripsHostHash = metaVersion(db: db) >= 24
         var out: [String: String] = [:]
         for row in rows {
             if !row.value.isEmpty { out[row.name] = row.value; continue }
-            guard row.encrypted.count > 3, row.encrypted.prefix(3) == Data("v10".utf8),
-                  var plain = aes128CBCDecrypt(row.encrypted.dropFirst(3), key: key)
+            guard var plain = SafeStorage.decrypt(row.encrypted, key: key)
             else { continue }
             // Newer Chromium prefixes the plaintext with SHA256(host_key).
             if stripsHostHash, plain.count >= 32 { plain = plain.dropFirst(32) }
@@ -164,21 +159,43 @@ public enum BrowserCookies {
         return out
     }
 
-    static func key(for browser: Browser, readPassword: (String, String) -> Data? = keychainPassword) -> Data? {
+    static func key(for browser: Browser, readPassword: (String, String) -> Data? = SafeStorage.keychainPassword) -> Data? {
         guard let service = browser.keychainService, let account = browser.keychainAccount else { return nil }
-        keyLock.lock(); defer { keyLock.unlock() }
-        if let cached = keyCache[service] { return cached.isEmpty ? nil : cached }
-        // Remember denial/cancellation too: a poll must never immediately ask again.
-        keyCache[service] = Data()
-        guard let password = readPassword(service, account) else { return nil }
+        return SafeStorage.key(service: service, account: account, readPassword: readPassword)
+    }
+}
 
+/// Electron and Chromium Safe Storage share the same macOS key derivation and envelope.
+enum SafeStorage {
+    final class Cache: @unchecked Sendable {
+        fileprivate let lock = NSLock()
+        fileprivate var keys: [Identity: Data] = [:] // Empty data represents a denied lookup.
+    }
+    fileprivate struct Identity: Hashable { let service: String; let account: String }
+    private static let shared = Cache()
+
+    static func validEnvelope(_ data: Data) -> Bool {
+        data.count > 3 && data.prefix(3) == Data("v10".utf8) && (data.count - 3) % 16 == 0
+    }
+
+    static func decrypt(_ data: Data, key: Data) -> Data? {
+        guard validEnvelope(data) else { return nil }
+        return aes128CBCDecrypt(Data(data.dropFirst(3)), key: key)
+    }
+
+    static func key(service: String, account: String, readPassword: (String, String) -> Data? = keychainPassword,
+                    cache: Cache = shared) -> Data? {
+        cache.lock.lock(); defer { cache.lock.unlock() }
+        let identity = Identity(service: service, account: account)
+        if let cached = cache.keys[identity] { return cached.isEmpty ? nil : cached }
+        cache.keys[identity] = Data()
+        guard let password = readPassword(service, account) else { return nil }
         var derived = Data(count: kCCKeySizeAES128)
         let salt = Data("saltysalt".utf8)
         let status = derived.withUnsafeMutableBytes { out in
             salt.withUnsafeBytes { s in
                 password.withUnsafeBytes { p in
-                    CCKeyDerivationPBKDF(
-                        CCPBKDFAlgorithm(kCCPBKDF2),
+                    CCKeyDerivationPBKDF(CCPBKDFAlgorithm(kCCPBKDF2),
                         p.baseAddress?.assumingMemoryBound(to: CChar.self), password.count,
                         s.baseAddress?.assumingMemoryBound(to: UInt8.self), salt.count,
                         CCPseudoRandomAlgorithm(kCCPRFHmacAlgSHA1), 1003,
@@ -187,11 +204,11 @@ public enum BrowserCookies {
             }
         }
         guard status == kCCSuccess else { return nil }
-        keyCache[service] = derived
+        cache.keys[identity] = derived
         return derived
     }
 
-    private static func keychainPassword(service: String, account: String) -> Data? {
+    static func keychainPassword(service: String, account: String) -> Data? {
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
@@ -231,13 +248,17 @@ public enum BrowserCookies {
 /// Opening a live WAL database even read-only can write its shared-memory sidecar. Read immutable
 /// without a WAL; otherwise let SQLite recover a private copy and remove it immediately afterward.
 enum CredentialDatabase {
-    static func read<T>(_ db: URL, _ body: (OpaquePointer) -> T?) -> T? {
+    static func read<T>(_ db: URL, cloneFirst: Bool = false, _ body: (OpaquePointer) -> T?) -> T? {
         let fm = FileManager.default
         var directory: URL?
         defer { if let directory { try? fm.removeItem(at: directory) } }
         var source = db
         let hasWAL = fm.fileExists(atPath: db.path + "-wal")
-        if hasWAL {
+        if cloneFirst {
+            guard let snapshot = snapshot(db) else { return nil }
+            directory = snapshot.deletingLastPathComponent()
+            source = snapshot
+        } else if hasWAL {
             let temp = fm.temporaryDirectory.appendingPathComponent("tinybar-credentials-\(UUID().uuidString)")
             directory = temp
             do {
@@ -248,7 +269,8 @@ enum CredentialDatabase {
             } catch { return nil }
         }
         let path = source.path.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? source.path
-        let uri = "file:\(path)?" + (hasWAL ? "mode=ro" : "immutable=1")
+        let snapshotHasWAL = fm.fileExists(atPath: source.path + "-wal")
+        let uri = "file:\(path)?" + (snapshotHasWAL ? "mode=ro" : "immutable=1")
         var handle: OpaquePointer?
         guard sqlite3_open_v2(uri, &handle, SQLITE_OPEN_READONLY | SQLITE_OPEN_URI, nil) == SQLITE_OK, let handle else {
             sqlite3_close_v2(handle)
@@ -258,6 +280,46 @@ enum CredentialDatabase {
         sqlite3_busy_timeout(handle, 500)
         return body(handle)
     }
+    private struct FileState: Equatable {
+        let inode: UInt64
+        let size: UInt64
+        let modified: Date
+    }
+
+    private static func state(_ url: URL) -> FileState? {
+        guard let attrs = try? FileManager.default.attributesOfItem(atPath: url.path),
+              let inode = attrs[.systemFileNumber] as? NSNumber,
+              let size = attrs[.size] as? NSNumber, let modified = attrs[.modificationDate] as? Date else { return nil }
+        return FileState(inode: inode.uint64Value, size: size.uint64Value, modified: modified)
+    }
+
+    private static func snapshot(_ db: URL) -> URL? {
+        let fm = FileManager.default
+        let wal = URL(fileURLWithPath: db.path + "-wal")
+        for _ in 0..<2 {
+            guard let before = state(db) else { return nil }
+            let walBefore = state(wal)
+            let dir = fm.temporaryDirectory.appendingPathComponent("tinybar-credentials-\(UUID().uuidString)")
+            let target = dir.appendingPathComponent("snapshot.sqlite")
+            do {
+                try fm.createDirectory(at: dir, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
+                func clone(_ source: URL, _ dest: URL, size: UInt64) throws {
+                    if clonefile(source.path, dest.path, 0) != 0 {
+                        guard before.size <= 64 * 1024 * 1024, size <= 64 * 1024 * 1024 else {
+                            throw CocoaError(.fileWriteOutOfSpace)
+                        }
+                        try fm.copyItem(at: source, to: dest)
+                    }
+                }
+                try clone(db, target, size: before.size)
+                if let walBefore { try clone(wal, URL(fileURLWithPath: target.path + "-wal"), size: walBefore.size) }
+                if state(db) == before && state(wal) == walBefore { return target }
+            } catch { /* A concurrent checkpoint may have removed the WAL; retry. */ }
+            try? fm.removeItem(at: dir)
+        }
+        return nil
+    }
+
 }
 
 /// Fetches limits using only the browser session (for diagnostics and the settings screen).

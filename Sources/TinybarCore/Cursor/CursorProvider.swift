@@ -8,40 +8,58 @@ import SQLite3
 public struct CursorProvider: UsageProvider {
     public let id = ProviderID.cursor
     private let session: URLSession
+    private let storedToken: @Sendable () -> String?
+    private let browserCookie: @Sendable (String) -> String?
+    private let password: @Sendable (String, String) -> Data?
+    private let cache: SafeStorage.Cache?
 
     public init(session: URLSession = .tinybar) {
+        self.init(session: session, storedToken: { CursorAppAuth.storedAccessToken() },
+                  browserCookie: { BrowserCookies.find(domain: $0, required: [CursorUsageAPI.sessionCookie])?.cookies[CursorUsageAPI.sessionCookie] })
+    }
+
+    init(session: URLSession = .tinybar, storedToken: @escaping @Sendable () -> String?,
+         browserCookie: @escaping @Sendable (String) -> String?,
+         password: @escaping @Sendable (String, String) -> Data? = SafeStorage.keychainPassword,
+         cache: SafeStorage.Cache? = nil) {
         self.session = session
+        self.storedToken = storedToken
+        self.browserCookie = browserCookie
+        self.password = password
+        self.cache = cache
     }
 
     /// Auto-enabled only when Cursor.app holds a login; the browser path is opt-in via Settings.
     public func isConfigured() -> Bool {
-        CursorAppAuth.storedAccessToken() != nil
+        storedToken() != nil
     }
 
     public func fetch() async throws -> ProviderSnapshot {
         var lastError = ProviderError.notConfigured
-        if let stored = CursorAppAuth.storedAccessToken() {
-            if let token = CursorAppAuth.accessToken(stored),
-               let cookie = CursorAppAuth.cookieHeader(accessToken: token) {
+        if let stored = storedToken() {
+            var token: String?
+            do {
+                token = try CursorAppAuth.resolve(stored, readPassword: password, cache: cache)
+            } catch let error as ProviderError {
+                lastError = error
+            }
+            if let token, let cookie = CursorAppAuth.cookieHeader(accessToken: token) {
                 do {
                     return try await CursorUsageAPI.fetch(cookieHeader: cookie, source: .cli, session: session)
                 } catch let error as ProviderError {
                     guard error == .loginExpired else { throw error }
                     lastError = error
                 }
-            } else {
-                lastError = .loginExpired
             }
         }
         for domain in ["cursor.com", "www.cursor.com"] {
-            guard let found = BrowserCookies.find(domain: domain, required: [CursorUsageAPI.sessionCookie]),
-                  let value = found.cookies[CursorUsageAPI.sessionCookie]
-            else { continue }
+            guard let value = browserCookie(domain) else { continue }
             return try await CursorUsageAPI.fetch(
                 cookieHeader: "\(CursorUsageAPI.sessionCookie)=\(value)", source: .browser, session: session)
         }
         throw lastError
     }
+
 }
 
 /// Cursor.app (a VS Code fork) keeps its login in `state.vscdb`, key `cursorAuth/accessToken`.
@@ -54,6 +72,32 @@ enum CursorAppAuth {
     /// Presence keeps an expired login visible; usability is checked only when fetching.
     static func storedAccessToken(db: URL = stateDB) -> String? {
         guard let token = readItem("cursorAuth/accessToken", db: db), !token.isEmpty else { return nil }
+        return token
+    }
+
+    static func resolve(_ stored: String, now: Date = Date(),
+                        readPassword: (String, String) -> Data? = SafeStorage.keychainPassword,
+                        cache: SafeStorage.Cache? = nil) throws -> String {
+        let malformed = ProviderError.unexpected("Invalid or unsupported Cursor app login")
+        var token = stored
+        if stored.hasPrefix("cursor-safe-storage:") {
+            let prefix = "cursor-safe-storage:v1:"
+            guard stored.hasPrefix(prefix), let envelope = Data(base64Encoded: String(stored.dropFirst(prefix.count))),
+                  SafeStorage.validEnvelope(envelope) else { throw malformed }
+            let key: Data?
+            if let cache {
+                key = SafeStorage.key(service: "Cursor Safe Storage", account: "Cursor Key", readPassword: readPassword, cache: cache)
+            } else {
+                key = SafeStorage.key(service: "Cursor Safe Storage", account: "Cursor Key", readPassword: readPassword)
+            }
+            guard let key else {
+                throw ProviderError.unexpected("Allow Keychain access for 'Cursor Safe Storage' and relaunch Tinybar")
+            }
+            guard let plain = SafeStorage.decrypt(envelope, key: key), let decoded = String(data: plain, encoding: .utf8) else { throw malformed }
+            token = decoded
+        }
+        guard jwtPayload(token) != nil, cookieHeader(accessToken: token) != nil else { throw malformed }
+        guard accessToken(token, now: now) != nil else { throw ProviderError.loginExpired }
         return token
     }
 
@@ -86,7 +130,7 @@ enum CursorAppAuth {
 
     /// Never lets SQLite write beside Cursor's database, including its WAL sidecars.
     static func readItem(_ key: String, db: URL = stateDB) -> String? {
-        CredentialDatabase.read(db) { handle in
+        CredentialDatabase.read(db, cloneFirst: true) { handle in
             var stmt: OpaquePointer?
             guard sqlite3_prepare_v2(handle, "SELECT value FROM ItemTable WHERE key = ? LIMIT 1", -1, &stmt, nil) == SQLITE_OK else {
                 return nil
