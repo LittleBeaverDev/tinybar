@@ -37,7 +37,7 @@ public struct DailyStat: Sendable, Hashable {
 public actor UsageStore {
     private let db: SQLiteDB
     private let projects = ProjectResolver()
-    private static let schemaVersion: Int64 = 9
+    private static let schemaVersion: Int64 = 10
 
     public init(path: URL = Paths.appSupport.appendingPathComponent("usage.sqlite")) throws {
         let db = try SQLiteDB(path: path.path)
@@ -52,6 +52,11 @@ public actor UsageStore {
     private static func migrate(_ db: SQLiteDB) throws {
         let version = try db.run("PRAGMA user_version").first?.first?.int ?? 0
         guard version < schemaVersion else { return }
+        try db.exec("CREATE TABLE IF NOT EXISTS pi_message (id TEXT PRIMARY KEY, day TEXT NOT NULL, provider TEXT NOT NULL, model TEXT NOT NULL, context INTEGER NOT NULL) WITHOUT ROWID;")
+        if version == 9 {
+            try db.exec("PRAGMA user_version = 10;")
+            return
+        }
         if version == 7 || version == 8 {
             // 0.9.0 keeps readings per Account. The ones so far can mix Accounts, so they stay
             // unclaimed (SPEC §14).
@@ -233,14 +238,17 @@ public actor UsageStore {
     public static var codexRoots: [URL] { Paths.codexLogRoots() }
 
     public static var claudeRoots: [URL] { Paths.claudeLogRoots() }
+    public static var piRoots: [URL] { Paths.piLogRoots() }
+    public static var logRoots: [URL] { codexRoots + claudeRoots + piRoots }
 
     public enum LogSource: String, Sendable, CaseIterable {
-        case codex, claude
+        case codex, claude, pi
 
         public var roots: [URL] {
             switch self {
             case .codex: UsageStore.codexRoots
             case .claude: UsageStore.claudeRoots
+            case .pi: UsageStore.piRoots
             }
         }
     }
@@ -281,6 +289,12 @@ public actor UsageStore {
         progress: (@Sendable (IngestProgress) -> Void)? = nil) throws -> IngestResult
     {
         try ingest(.claude, roots: roots, only: only, progress: progress)
+    }
+
+    @discardableResult
+    public func ingestPi(roots: [URL] = UsageStore.piRoots, only: Set<String>? = nil,
+                         progress: (@Sendable (IngestProgress) -> Void)? = nil) throws -> IngestResult {
+        try ingest(.pi, roots: roots, only: only, progress: progress)
     }
 
     /// OpenCode's database and WAL at the last good read, to skip reading them unchanged.
@@ -397,6 +411,7 @@ public actor UsageStore {
                             switch source {
                             case .codex: return try ingestCodexFile(path: path, stamp: stamp, cursor: cursor, mode: .incremental)
                             case .claude: return try ingestClaudeFile(path: path, stamp: stamp, cursor: cursor, mode: .incremental)
+                            case .pi: return try ingestPiFile(path: path, stamp: stamp, cursor: cursor)
                             }
                         }
                         try db.exec("RELEASE ingest_file")
@@ -499,6 +514,43 @@ public actor UsageStore {
             try saveCursor(path: path, source: .codex, stamp: stamp, offset: endOffset, state: state)
         }
         return (endOffset - offset, added)
+    }
+
+    private func ingestPiFile(path: String, stamp: FileStamp, cursor: Cursor?) throws -> (Int64, Int) {
+        var parser = PiLogParser()
+        var offset: Int64 = 0
+        if let cursor, cursor.stamp.inode == stamp.inode, stamp.size > cursor.stamp.size || stamp == cursor.stamp,
+           let state = cursor.state, let decoded = try? JSONDecoder().decode(PiLogParser.self, from: state) {
+            parser = decoded
+            offset = cursor.offset
+        }
+        var entries: [PiLogParser.Entry] = []
+        let end = try JSONLReader.forEachLine(url: URL(fileURLWithPath: path), from: offset) { line in
+            if let entry = parser.consume(line: line) { entries.append(entry) }
+        }
+        var added = 0
+        var stats = StatBatch()
+        for entry in entries {
+            guard let provider = ProviderID(rawValue: entry.provider) else { continue }
+            let record = entry.record
+            let day = DayKey.string(for: record.timestamp)
+            let model = record.model
+            try db.run("INSERT OR IGNORE INTO pi_message (id, day, provider, model, context) VALUES (?, ?, ?, ?, ?)",
+                       [.text(entry.id), .text(day), .text(provider.rawValue), .text(model), .int(record.tokens.context)])
+            guard db.changes > 0 else { continue }
+            try addTokens(day: day, provider: provider, model: model, project: projects.project(for: record.cwd), record.tokens)
+            stats.addResponse(day: day, provider: provider, model: model, at: record.timestamp, tokens: record.tokens)
+            for tool in entry.tools {
+                var values = tool.commandStats
+                values[StatKey.tool(tool.name), default: 0] += 1
+                stats.add(StatEvent(timestamp: record.timestamp, values: values), provider: provider, model: model)
+            }
+            added += 1
+        }
+        try write(stats)
+        let state = (try? JSONEncoder().encode(parser)).map { String(decoding: $0, as: UTF8.self) }
+        try saveCursor(path: path, source: .pi, stamp: stamp, offset: end, state: state)
+        return (end - offset, added)
     }
 
     private func ingestClaudeFile(path: String, stamp: FileStamp, cursor: Cursor?, mode: ReadMode, limit: Int64? = nil) throws -> (Int64, Int) {
@@ -611,9 +663,12 @@ public actor UsageStore {
                 // A complete copy can carry less context than its preliminary line: drop the peak
                 // that line set to the largest of the day's other messages.
                 let others = try db.run("""
-                SELECT max(input + cache_write + cache_read) FROM claude_message
-                WHERE day = ? AND provider = ? AND model = ? AND id != ?
-                """, [.text(day), .text(provider.rawValue), .text(model), .text(id)]).first?.first?.int ?? 0
+                SELECT max(context) FROM (
+                    SELECT input + cache_write + cache_read AS context FROM claude_message
+                    WHERE day = ? AND provider = ? AND model = ? AND id != ?
+                    UNION ALL SELECT context FROM pi_message WHERE day = ? AND provider = ? AND model = ?
+                )
+                """, [.text(day), .text(provider.rawValue), .text(model), .text(id), .text(day), .text(provider.rawValue), .text(model)]).first?.first?.int ?? 0
                 try db.run("""
                 UPDATE daily_stat SET value = ? WHERE day = ? AND provider = ? AND model = ? AND key = ? AND value = ?
                 """, [.int(others), .text(day), .text(provider.rawValue), .text(model), .text(StatKey.contextMax), .int(old.context)])
@@ -678,7 +733,7 @@ public actor UsageStore {
         SELECT path, provider, CAST(meta.value AS INTEGER) FROM file_cursor
         JOIN meta ON meta.key = 'stats_backfill_limit:' || path ORDER BY path
         """).compactMap { r -> (String, LogSource, Int64)? in
-            guard let path = r[0].text, let source = r[1].text.flatMap(LogSource.init(rawValue:)) else { return nil }
+            guard let path = r[0].text, let source = r[1].text.flatMap(LogSource.init(rawValue:)), source != .pi else { return nil }
             return (path, source, r[2].int)
         }
         var result = IngestResult(filesScanned: 0, bytesRead: 0, recordsAdded: 0)
@@ -703,6 +758,7 @@ public actor UsageStore {
                             switch source {
                             case .codex: try ingestCodexFile(path: path, stamp: stamp, cursor: cursor, mode: .backfill, limit: limit)
                             case .claude: try ingestClaudeFile(path: path, stamp: stamp, cursor: cursor, mode: .backfill, limit: limit)
+                            case .pi: (0, 0) // pi is never part of a legacy backfill
                             }
                         }
                     } catch let error as ZstdReader.Failure {
@@ -795,7 +851,7 @@ public actor UsageStore {
         try db.run("""
         INSERT OR IGNORE INTO meta (key, value)
         SELECT ? || path, CAST(offset AS TEXT) FROM file_cursor
-        """ + (codexOnly ? " WHERE provider = 'codex'" : ""), [.text(key + "_limit:")])
+        """ + (codexOnly ? " WHERE provider = 'codex'" : " WHERE provider IN ('codex', 'claude')"), [.text(key + "_limit:")])
         try db.run("INSERT INTO meta (key, value) VALUES (?, 'done')", [.text(key + "_bounds")])
     }
 
@@ -1020,9 +1076,13 @@ public actor UsageStore {
 
     /// Every day with any tokens, oldest first: streaks span the whole history.
     /// Days with any usage, or with usage of one model, of the Providers Stats covers.
-    public func activeDays(model: String? = nil) throws -> [String] {
+    public func activeDays(model: String? = nil, provider: ProviderID? = nil) throws -> [String] {
         let covered = "provider IN (" + ProviderID.allCases.filter(\.hasActivity).map { "'\($0.rawValue)'" }.joined(separator: ", ") + ")"
         if let model {
+            if let provider {
+                return try db.run("SELECT DISTINCT day FROM daily_usage WHERE \(covered) AND model = ? AND provider = ? ORDER BY day", [.text(model), .text(provider.rawValue)])
+                    .compactMap { $0.first?.text }
+            }
             return try db.run("SELECT DISTINCT day FROM daily_usage WHERE \(covered) AND model = ? ORDER BY day", [.text(model)])
                 .compactMap { $0.first?.text }
         }

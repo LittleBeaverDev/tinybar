@@ -161,6 +161,11 @@ public enum Paths {
         return unique(claudeConfigDirs(env: env).map { $0.appendingPathComponent("projects", isDirectory: true) } + others.filter(exists).map { $0.resolvingSymlinksInPath() })
     }
 
+    /// pi session logs are separate from the legacy default roots used by upgraded stores.
+    public static func piLogRoots(home: URL = Paths.home) -> [URL] {
+        [home.appendingPathComponent(".pi/agent/sessions", isDirectory: true)]
+    }
+
     /// Every place the Codex CLI logs, the default first.
     public static func codexLogRoots(
         home: URL = Paths.home, env: [String: String] = ProcessInfo.processInfo.environment,

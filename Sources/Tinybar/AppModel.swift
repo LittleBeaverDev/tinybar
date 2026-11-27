@@ -91,7 +91,7 @@ final class AppModel {
 
     init(settings: Settings) {
         self.settings = settings
-        logRoots = UsageStore.codexRoots + UsageStore.claudeRoots
+        logRoots = UsageStore.logRoots
         logWatcher = LogWatcher(roots: logRoots)
         let browserFlags = settings.browserFallbackFlags
         sources = [
@@ -537,7 +537,7 @@ final class AppModel {
         // A log folder its import didn't finish is as heavy as an initial import, so it waits too.
         if !initialImportFailed, (try? await store.unreadLogRoots().isEmpty) ?? true {
             // A login folder or `cswap run` profile that appeared gets watched and read from now on.
-            let roots = UsageStore.codexRoots + UsageStore.claudeRoots
+            let roots = UsageStore.logRoots
             if roots != logRoots {
                 logRoots = roots
                 logWatcher = LogWatcher(roots: roots)
@@ -625,7 +625,7 @@ final class AppModel {
 
     /// Reads what the Stats window shows for a range. Only runs while that window is open; nothing
     /// is kept afterwards.
-    func statsSummary(_ range: StatsRange, model: String? = nil) async -> StatsSummary? {
+    func statsSummary(_ range: StatsRange, model: String? = nil, provider: ProviderID? = nil) async -> StatsSummary? {
         guard let store else { return nil }
         let since = range.days.map { DayKey.daysAgo($0 - 1) } ?? "0000"
         do {
@@ -633,9 +633,9 @@ final class AppModel {
             let stats = try await store.stats(since: since)
             // All time starts at the first day of any model, so the model list stays complete.
             let days = try await store.activeDays()
-            let modelDays = model == nil ? nil : try await store.activeDays(model: model)
+            let modelDays = model == nil ? nil : try await store.activeDays(model: model, provider: provider)
             var summary = StatsSummary.build(
-                usage: usage, stats: stats, allDays: days, streakDays: modelDays, range: range, model: model, prices: prices)
+                usage: usage, stats: stats, allDays: days, streakDays: modelDays, range: range, model: model, modelProvider: provider, prices: prices)
             if CommandLine.arguments.contains("--redact-projects") {
                 for i in summary.topProjects.indices {
                     summary.topProjects[i].name = "Project \(i + 1)"

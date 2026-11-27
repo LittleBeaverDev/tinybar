@@ -30,7 +30,7 @@ enum HistoryImport {
                     // store's pending migrations before reading new bytes; each marks itself done.
                     if !(try await store.hasCompletedStatsBackfill()) { _ = try await store.backfillStats(progress: report) }
                     if !(try await store.hasCompletedLongContextBackfill()) { _ = try await store.backfillLongContext(progress: report) }
-                    let roots = UsageStore.codexRoots + UsageStore.claudeRoots
+                    let roots = UsageStore.logRoots
                     _ = try await store.ingestAll(progress: report)
                     // OpenCode's own job retries this: a bad database of theirs doesn't stop the rest.
                     try? await store.importOpenCode()
@@ -43,7 +43,7 @@ enum HistoryImport {
                 case .importOpenCode:
                     if !(try await store.hasCompletedOpenCodeImport()) { try await store.importOpenCode() }
                 case .importLogFolders:
-                    let roots = UsageStore.codexRoots + UsageStore.claudeRoots
+                    let roots = UsageStore.logRoots
                     _ = try await store.ingestAll(progress: report)
                     try await store.markLogRootsRead(roots)
                 }
