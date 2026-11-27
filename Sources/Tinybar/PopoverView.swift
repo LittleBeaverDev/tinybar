@@ -1241,8 +1241,8 @@ private struct SettingsPage: View {
         @Bindable var settings = model.settings
         VStack(alignment: .leading, spacing: 18) {
             SettingsSection("Subscriptions", footer: "Tinybar turns on each subscription it finds a login for.") {
-                ForEach(ProviderID.allCases, id: \.self) { id in
-                    SubscriptionRow(model: model, id: id, first: id == ProviderID.allCases.first) { open(id) }
+                ForEach(ProviderID.subscriptionProviders, id: \.self) { id in
+                    SubscriptionRow(model: model, id: id, first: id == ProviderID.subscriptionProviders.first) { open(id) }
                 }
             }
             OtherLoginsSection(model: model)

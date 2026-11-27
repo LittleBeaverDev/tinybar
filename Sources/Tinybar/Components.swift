@@ -364,6 +364,7 @@ extension ProviderID {
         case .opencode: "opencode.ai"
         case .copilot: "github.com"
         case .grok: "grok.com"
+        case .piOther: ""
         }
     }
 
@@ -381,6 +382,7 @@ extension ProviderID {
         case .copilot: Color(red: 0.51, green: 0.31, blue: 0.87)
         // Its mark is monochrome too, and this blue is taken by nothing that shows on a chart.
         case .grok: Color(red: 0.20, green: 0.55, blue: 0.95)
+        case .piOther: Color(red: 0.85, green: 0.62, blue: 0.18)
         }
     }
 

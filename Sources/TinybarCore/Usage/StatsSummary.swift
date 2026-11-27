@@ -71,7 +71,7 @@ public struct StatsSummary: Sendable {
     }
 
     public struct Model: Sendable, Identifiable {
-        public var id: String { name }
+        public var id: String { provider.rawValue + ":" + name }
         public var name: String
         public var provider: ProviderID
         public var tokens: Int64
@@ -131,6 +131,7 @@ public struct StatsSummary: Sendable {
     public var range: StatsRange
     /// The model everything is filtered to, if one is picked.
     public var model: String?
+    public var modelProvider: ProviderID? = nil
     public var firstDay: String
     public var lastDay: String
 
@@ -190,7 +191,7 @@ public struct StatsSummary: Sendable {
     /// Streaks count `streakDays` instead when given (the days one model was used).
     public static func build(
         usage: [DailyUsage], stats: [DailyStat], allDays: [String], streakDays: [String]? = nil,
-        range: StatsRange, model: String? = nil,
+        range: StatsRange, model: String? = nil, modelProvider: ProviderID? = nil,
         prices: PriceTable, now: Date = Date(), calendar: Calendar = .current) -> StatsSummary
     {
         let today = DayKey.string(for: now, calendar: calendar)
@@ -204,8 +205,8 @@ public struct StatsSummary: Sendable {
         // with no prompts or tools behind it would read as missing logs.
         let allUsage = usage.filter { $0.day >= first && $0.day <= today && $0.provider.hasActivity }
         let allStats = stats.filter { $0.day >= first && $0.day <= today }
-        let usage = model.map { m in allUsage.filter { $0.model == m } } ?? allUsage
-        let stats = model.map { m in allStats.filter { $0.model == m } } ?? allStats
+        let usage = model.map { m in allUsage.filter { $0.model == m && (modelProvider == nil || $0.provider == modelProvider) } } ?? allUsage
+        let stats = model.map { m in allStats.filter { $0.model == m && (modelProvider == nil || $0.provider == modelProvider) } } ?? allStats
 
         // Every day in the range, then the bars they fall into.
         var dayList: [String] = []
@@ -352,7 +353,7 @@ public struct StatsSummary: Sendable {
         }
 
         return StatsSummary(
-            range: range, model: model, firstDay: first, lastDay: today,
+            range: range, model: model, modelProvider: modelProvider, firstDay: first, lastDay: today,
             tokens: tokens, allTokens: allUsage.reduce(0) { $0 + $1.tokens.total }, tokenCounts: counts, tokensByProvider: byProvider, cost: priced ? cost : nil, hasUnpriced: unpriced, bucket: bucket, bars: bars,
             prompts: sums[StatKey.prompts] ?? 0,
             responses: sums[StatKey.responses] ?? 0,
@@ -376,29 +377,32 @@ public struct StatsSummary: Sendable {
     private static func models(_ usage: [DailyUsage], _ stats: [DailyStat], _ prices: PriceTable) -> [Model] {
         var models: [String: Model] = [:]
         for r in usage {
-            var m = models[r.model] ?? Model(name: r.model, provider: r.provider, tokens: 0, cost: 0, responses: 0,
+            let key = r.provider.rawValue + ":" + r.model
+            var m = models[key] ?? Model(name: r.model, provider: r.provider, tokens: 0, cost: 0, responses: 0,
                                               speed: nil, speedSamples: 0, peakContext: 0)
             m.tokens += r.tokens.total
             let c = prices.cost(r)
             m.cost = c.flatMap { c in m.cost.map { $0 + c } }
-            models[r.model] = m
+            models[key] = m
         }
         var speed: [String: (tokens: Int64, ms: Int64)] = [:]
-        for s in stats where models[s.model] != nil {
+        for s in stats {
+            let key = s.provider.rawValue + ":" + s.model
+            guard models[key] != nil else { continue }
             switch s.key {
-            case StatKey.responses: models[s.model]?.responses += s.value
+            case StatKey.responses: models[key]?.responses += s.value
             case StatKey.contextMax:
-                let peak = models[s.model]?.peakContext ?? 0
-                models[s.model]?.peakContext = max(peak, s.value)
-            case StatKey.speedTokens: speed[s.model, default: (0, 0)].tokens += s.value
-            case StatKey.speedMillis: speed[s.model, default: (0, 0)].ms += s.value
-            case StatKey.speedSamples: models[s.model]?.speedSamples += s.value
+                let peak = models[key]?.peakContext ?? 0
+                models[key]?.peakContext = max(peak, s.value)
+            case StatKey.speedTokens: speed[key, default: (0, 0)].tokens += s.value
+            case StatKey.speedMillis: speed[key, default: (0, 0)].ms += s.value
+            case StatKey.speedSamples: models[key]?.speedSamples += s.value
             default:
                 if !s.key.hasPrefix(StatKey.hourPrefix), !s.key.hasPrefix(StatKey.hourTokensPrefix) {
-                    models[s.model]?.values[s.key, default: 0] += s.value
+                    models[key]?.values[s.key, default: 0] += s.value
                 }
             }
-            if s.key == StatKey.responses { models[s.model]?.values[s.key, default: 0] += s.value }
+            if s.key == StatKey.responses { models[key]?.values[s.key, default: 0] += s.value }
         }
         for (name, s) in speed {
             guard let m = models[name], m.speedSamples >= minimumSpeedSamples, s.ms > 0 else { continue }

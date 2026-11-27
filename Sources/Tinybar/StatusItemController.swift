@@ -150,7 +150,7 @@ enum RingIcon {
             NSColor(srgbRed: 0.97, green: 0.38, blue: 0.35, alpha: 1),
         ])
         // Codex (OpenAI's mark), Cursor, OpenCode, Copilot and Grok are monochrome, like the menu bar itself.
-        case .codex, .cursor, .opencode, .copilot, .grok: nil
+        case .codex, .cursor, .opencode, .copilot, .grok, .piOther: nil
         }
     }
 
