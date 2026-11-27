@@ -559,6 +559,9 @@ final class AppModel {
         }
 
         guard !isAsleep, !isLocked else { return }
+        if enabledProviders.contains(.cursor), let token = try? CursorProvider.activityAccessToken() {
+            try? await store.syncCursorUsage(accessToken: token)
+        }
         prices = await pricing.refreshIfNeeded()
         guard !isAsleep, !isLocked else { return }
         usageRows = (try? await store.daily(since: DayKey.daysAgo(UsageRange.month.days - 1))) ?? []

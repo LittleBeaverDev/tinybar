@@ -209,7 +209,7 @@ struct StatsPalette {
     }
 
     func color(_ provider: ProviderID) -> Color {
-        provider == .claude ? claude : ink
+        provider == .claude ? claude : (provider == .gemini ? ProviderID.Gemini.blue : (provider == .cursor ? .gray : ink))
     }
 }
 
@@ -261,7 +261,7 @@ struct StatsCard: View {
             } else if summary != nil {
                 VStack(spacing: 6) {
                     Text("Nothing to count yet").font(.system(size: 17, weight: .semibold))
-                    Text("Stats come from Claude Code and Codex logs. Run a session and they show up here.")
+                    Text("Stats come from local activity and Cursor usage events. Run a session and they show up here.")
                         .font(.system(size: 13))
                         .foregroundStyle(palette.ink2)
                 }

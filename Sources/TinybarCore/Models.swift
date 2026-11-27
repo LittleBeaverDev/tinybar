@@ -54,7 +54,7 @@ public enum ProviderID: String, Codable, Sendable, CaseIterable, Comparable {
     public var hasBrowserFallback: Bool { self == .claude || self == .codex }
 
     /// Whether its logs are read for Activity, which the Stats window is built on (ADR 0006).
-    public var hasActivity: Bool { self == .claude || self == .codex || self == .opencode || self == .piOther }
+    public var hasActivity: Bool { self == .claude || self == .codex || self == .opencode || self == .piOther || self == .gemini || self == .cursor }
 
     public static var subscriptionProviders: [ProviderID] { allCases.filter { $0 != .piOther } }
 

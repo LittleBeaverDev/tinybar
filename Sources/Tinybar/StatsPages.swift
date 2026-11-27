@@ -72,6 +72,8 @@ struct SplitNumber: View {
         let number = value.formatted(.number)
         let size = min(96, TokensHero.fontSize(max(sizedTo, value).formatted(.number), width: width))
         let claude = TokensHero.split(number, share: Double(byProvider[.claude] ?? 0) / Double(max(value, 1)))
+        let geminiEnd = TokensHero.split(number, share: Double((byProvider[.claude] ?? 0) + (byProvider[.gemini] ?? 0)) / Double(max(value, 1)))
+        let cursorEnd = TokensHero.split(number, share: Double((byProvider[.claude] ?? 0) + (byProvider[.gemini] ?? 0) + (byProvider[.cursor] ?? 0)) / Double(max(value, 1)))
         VStack(alignment: .leading, spacing: 2) {
             Text(number)
                 .font(.system(size: size, weight: .heavy).width(.compressed))
@@ -81,7 +83,11 @@ struct SplitNumber: View {
                     stops: [
                         .init(color: palette.claude, location: 0),
                         .init(color: palette.claude, location: claude),
-                        .init(color: palette.ink, location: claude),
+                        .init(color: palette.color(.gemini), location: claude),
+                        .init(color: palette.color(.gemini), location: geminiEnd),
+                        .init(color: palette.color(.cursor), location: geminiEnd),
+                        .init(color: palette.color(.cursor), location: cursorEnd),
+                        .init(color: palette.ink, location: cursorEnd),
                         .init(color: palette.ink, location: 1),
                     ],
                     startPoint: .leading, endPoint: .trailing))
