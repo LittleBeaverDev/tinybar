@@ -18,6 +18,18 @@ public enum Paths {
         return home.appendingPathComponent(folder, isDirectory: true)
     }
 
+    public static func agyHome(home: URL = Paths.home) -> URL {
+        home.appendingPathComponent(".gemini/antigravity-cli", isDirectory: true)
+    }
+
+    public static func agyBrain(home: URL = Paths.home) -> URL {
+        agyHome(home: home).appendingPathComponent("brain", isDirectory: true)
+    }
+
+    public static func agySummaries(home: URL = Paths.home) -> URL {
+        agyHome(home: home).appendingPathComponent("conversation_summaries.db")
+    }
+
     public static func codexHome(env: [String: String] = ProcessInfo.processInfo.environment) -> URL {
         cliHome("CODEX_HOME", default: ".codex", env: env)
     }
