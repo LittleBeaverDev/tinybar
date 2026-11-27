@@ -406,7 +406,7 @@ private func statusPage(grokCom: String = "available", imagine: String = "availa
 }
 
 @Test func grokIsAProvider() {
-    #expect(ProviderID.allCases.last == .grok, "new Providers go last, keeping tab shortcuts")
+    #expect(ProviderID.allCases.suffix(2) == [.grok, .piOther], "new Providers go last, keeping tab shortcuts")
     #expect(StatusFeed.hasFeed(.grok) && !ProviderID.grok.hasBrowserFallback && !ProviderID.grok.hasActivity)
     #expect(ProviderID.grok.loginHint == "run `grok` once to refresh, or `grok login`")
     #expect(ProviderID.grok.displayName == "Grok" && ProviderID.grok.cliCommand == "grok")

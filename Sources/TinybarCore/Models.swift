@@ -8,6 +8,7 @@ public enum ProviderID: String, Codable, Sendable, CaseIterable, Comparable {
     case opencode
     case copilot
     case grok
+    case piOther = "pi"
 
     public var displayName: String {
         switch self {
@@ -18,6 +19,7 @@ public enum ProviderID: String, Codable, Sendable, CaseIterable, Comparable {
         case .opencode: "OpenCode Go"
         case .copilot: "Copilot"
         case .grok: "Grok"
+        case .piOther: "Other via pi"
         }
     }
 
@@ -31,6 +33,7 @@ public enum ProviderID: String, Codable, Sendable, CaseIterable, Comparable {
         case .opencode: "opencode"
         case .copilot: "copilot"
         case .grok: "grok"
+        case .piOther: nil
         }
     }
 
@@ -42,6 +45,7 @@ public enum ProviderID: String, Codable, Sendable, CaseIterable, Comparable {
         case .opencode: "run `opencode auth login`"
         case .copilot: "run `copilot login` or `gh auth login`"
         case .grok: "run `grok` once to refresh, or `grok login`"
+        case .piOther: ""
         }
     }
 
@@ -50,7 +54,9 @@ public enum ProviderID: String, Codable, Sendable, CaseIterable, Comparable {
     public var hasBrowserFallback: Bool { self == .claude || self == .codex }
 
     /// Whether its logs are read for Activity, which the Stats window is built on (ADR 0006).
-    public var hasActivity: Bool { self == .claude || self == .codex }
+    public var hasActivity: Bool { self == .claude || self == .codex || self == .opencode || self == .piOther }
+
+    public static var subscriptionProviders: [ProviderID] { allCases.filter { $0 != .piOther } }
 
     public static func < (lhs: ProviderID, rhs: ProviderID) -> Bool {
         allCases.firstIndex(of: lhs)! < allCases.firstIndex(of: rhs)!
