@@ -363,14 +363,19 @@ public actor UsageStore {
         var changed: [(String, FileStamp)] = []
         if let only {
             let rootPaths = roots.map { $0.path + "/" }
-            for path in only where path.hasSuffix(".jsonl") && rootPaths.contains(where: path.hasPrefix) {
+            for path in only where Self.acceptsLog(path, source: source) && rootPaths.contains(where: path.hasPrefix) {
                 if let stamp = Self.stamp(path), try isChanged(path, stamp) { changed.append((path, stamp)) }
             }
         } else {
             for root in roots {
-                try Self.walkJSONL(root.path) { path, stamp in
+                try Self.walkJSONL(root.path, source: source) { path, stamp in
                     if try isChanged(path, stamp) { changed.append((path, stamp)) }
                 }
+            }
+        }
+        if source == .codex {
+            changed.removeAll { path, _ in
+                path.hasSuffix(".jsonl.zst") && Self.stamp(String(path.dropLast(4))) != nil
             }
         }
         // Oldest first, so a fork's parent is ingested before the fork when both are new.
@@ -383,12 +388,22 @@ public actor UsageStore {
             let batch = changed[index..<min(index + batchSize, changed.count)]
             try db.transaction {
                 for (path, stamp) in batch {
-                    let (read, added) = try autoreleasepool {
-                        let cursor = try source == .codex ? codexCursor(path: path, stamp: stamp) : loadCursor(path: path)
-                        switch source {
-                        case .codex: return try ingestCodexFile(path: path, stamp: stamp, cursor: cursor, mode: .incremental)
-                        case .claude: return try ingestClaudeFile(path: path, stamp: stamp, cursor: cursor, mode: .incremental)
+                    try db.exec("SAVEPOINT ingest_file")
+                    let read: Int64
+                    let added: Int
+                    do {
+                        (read, added) = try autoreleasepool {
+                            let cursor = try source == .codex ? codexCursor(path: path, stamp: stamp) : loadCursor(path: path)
+                            switch source {
+                            case .codex: return try ingestCodexFile(path: path, stamp: stamp, cursor: cursor, mode: .incremental)
+                            case .claude: return try ingestClaudeFile(path: path, stamp: stamp, cursor: cursor, mode: .incremental)
+                            }
                         }
+                        try db.exec("RELEASE ingest_file")
+                    } catch let error as ZstdReader.Failure {
+                        try db.exec("ROLLBACK TO ingest_file; RELEASE ingest_file")
+                        NSLog("Tinybar: could not decode %@: %@", path, String(describing: error))
+                        continue
                     }
                     result.filesScanned += 1
                     result.bytesRead += read
@@ -432,7 +447,7 @@ public actor UsageStore {
         if mode != .incremental {
             guard let cursor else { return (0, 0) }
             until = limit ?? cursor.offset
-        } else if let cursor, cursor.stamp.inode == stamp.inode, stamp.size > cursor.stamp.size || stamp == cursor.stamp,
+        } else if !path.hasSuffix(".zst"), let cursor, cursor.stamp.inode == stamp.inode, stamp.size > cursor.stamp.size || stamp == cursor.stamp,
            let state = cursor.state, let decoded = try? JSONDecoder().decode(CodexLogParser.self, from: state)
         {
             parser = decoded
@@ -445,7 +460,7 @@ public actor UsageStore {
         var long: [AggKey: TokenCounts] = [:]
         var stats = StatBatch()
         var added = 0
-        let endOffset = try JSONLReader.forEachLine(url: url, from: offset, until: until) { line in
+        func consume(_ line: UnsafeRawBufferPointer) {
             let current = ModelName.normalize(parser.model ?? "unknown")
             let record = parser.consume(line: line) { if mode != .longContext { stats.add($0, provider: .codex, model: current) } }
             guard let record else { return }
@@ -455,11 +470,18 @@ public actor UsageStore {
                 stats.addResponse(day: day, provider: .codex, model: model, at: record.timestamp, tokens: record.tokens)
             }
             if mode != .backfill {
-                let key = AggKey(day: day, model: model, project: projects.project(for: record.cwd))
+                let key = AggKey(day: day, model: model, project: self.projects.project(for: record.cwd))
                 if mode == .incremental { agg[key, default: TokenCounts()] += record.tokens }
                 if let band = ContextBand.of(record.tokens) { long[key.band(band), default: TokenCounts()] += record.tokens }
             }
             added += 1
+        }
+
+        let endOffset: Int64
+        if path.hasSuffix(".jsonl.zst") {
+            endOffset = try ZstdReader.forEachLine(url: url, until: until, consume)
+        } else {
+            endOffset = try JSONLReader.forEachLine(url: url, from: offset, until: until, consume)
         }
 
         for (key, t) in agg {
@@ -661,6 +683,7 @@ public actor UsageStore {
         }
         var result = IngestResult(filesScanned: 0, bytesRead: 0, recordsAdded: 0)
         let batchSize = 200
+        var failed = false
         var index = 0
         while index < cursors.count {
             let batch = cursors[index..<min(index + batchSize, cursors.count)]
@@ -671,13 +694,21 @@ public actor UsageStore {
                     let checkpoint = "stats_backfill_file:" + path
                     guard try db.run("SELECT 1 FROM meta WHERE key = ?", [.text(checkpoint)]).isEmpty else { continue }
                     guard let cursor = try loadCursor(path: path), let stamp = Self.stamp(path),
-                          stamp.inode == cursor.stamp.inode, stamp.size >= cursor.offset
+                          Self.canBackfill(path: path, stamp: stamp, cursor: cursor, limit: limit)
                     else { continue }  // gone or replaced: the next ingest reads it from the start
-                    let (read, added) = try autoreleasepool {
-                        switch source {
-                        case .codex: try ingestCodexFile(path: path, stamp: stamp, cursor: cursor, mode: .backfill, limit: limit)
-                        case .claude: try ingestClaudeFile(path: path, stamp: stamp, cursor: cursor, mode: .backfill, limit: limit)
+                    let read: Int64
+                    let added: Int
+                    do {
+                        (read, added) = try autoreleasepool {
+                            switch source {
+                            case .codex: try ingestCodexFile(path: path, stamp: stamp, cursor: cursor, mode: .backfill, limit: limit)
+                            case .claude: try ingestClaudeFile(path: path, stamp: stamp, cursor: cursor, mode: .backfill, limit: limit)
+                            }
                         }
+                    } catch let error as ZstdReader.Failure {
+                        NSLog("Tinybar: could not decode %@: %@", path, String(describing: error))
+                        failed = true
+                        continue
                     }
                     // Commit the checkpoint with its counters, so a restarted backfill cannot add them twice.
                     try db.run("INSERT INTO meta (key, value) VALUES (?, 'done')", [.text(checkpoint)])
@@ -691,7 +722,7 @@ public actor UsageStore {
             index += batch.count
             progress?(IngestProgress(filesDone: index, filesTotal: cursors.count))
         }
-        try markStatsBackfillDone()
+        if !failed { try markStatsBackfillDone() }
         if result.filesScanned > batchSize {
             try? db.exec("PRAGMA shrink_memory")
             malloc_zone_pressure_relief(nil, 0)
@@ -714,6 +745,7 @@ public actor UsageStore {
         """).compactMap { r -> (String, Int64)? in r[0].text.map { ($0, r[1].int) } }
         var result = IngestResult(filesScanned: 0, bytesRead: 0, recordsAdded: 0)
         let batchSize = 200
+        var failed = false
         var index = 0
         while index < paths.count {
             let batch = paths[index..<min(index + batchSize, paths.count)]
@@ -724,10 +756,18 @@ public actor UsageStore {
                     let checkpoint = "long_context_backfill_file:" + path
                     guard try db.run("SELECT 1 FROM meta WHERE key = ?", [.text(checkpoint)]).isEmpty else { continue }
                     guard let cursor = try loadCursor(path: path), let stamp = Self.stamp(path),
-                          stamp.inode == cursor.stamp.inode, stamp.size >= cursor.offset
+                          Self.canBackfill(path: path, stamp: stamp, cursor: cursor, limit: limit)
                     else { continue }
-                    let (read, added) = try autoreleasepool {
-                        try ingestCodexFile(path: path, stamp: stamp, cursor: cursor, mode: .longContext, limit: limit)
+                    let read: Int64
+                    let added: Int
+                    do {
+                        (read, added) = try autoreleasepool {
+                            try ingestCodexFile(path: path, stamp: stamp, cursor: cursor, mode: .longContext, limit: limit)
+                        }
+                    } catch let error as ZstdReader.Failure {
+                        NSLog("Tinybar: could not decode %@: %@", path, String(describing: error))
+                        failed = true
+                        continue
                     }
                     try db.run("INSERT INTO meta (key, value) VALUES (?, 'done')", [.text(checkpoint)])
                     result.filesScanned += 1
@@ -740,7 +780,7 @@ public actor UsageStore {
             index += batch.count
             progress?(IngestProgress(filesDone: index, filesTotal: paths.count))
         }
-        try markLongContextBackfillDone()
+        if !failed { try markLongContextBackfillDone() }
         if result.filesScanned > batchSize {
             try? db.exec("PRAGMA shrink_memory")
             malloc_zone_pressure_relief(nil, 0)
@@ -1044,6 +1084,12 @@ public actor UsageStore {
         var state: Data?
     }
 
+    /// Compressed stamps measure encoded bytes, while backfill limits are decoded offsets.
+    private static func canBackfill(path: String, stamp: FileStamp, cursor: Cursor, limit: Int64) -> Bool {
+        guard stamp.inode == cursor.stamp.inode else { return false }
+        return path.hasSuffix(".jsonl.zst") ? stamp == cursor.stamp : stamp.size >= limit
+    }
+
     private struct AggKey: Hashable {
         var day: String
         var model: String
@@ -1062,7 +1108,9 @@ public actor UsageStore {
             guard root.lastPathComponent == "sessions" else { continue }
             let archive = root.deletingLastPathComponent().appendingPathComponent("archived_sessions")
             let file = archive.appendingPathComponent((path as NSString).lastPathComponent).path
-            if let stamp = Self.stamp(file) { _ = try codexCursor(path: file, stamp: stamp) }
+            for candidate in [path + ".zst", file, file + ".zst"] {
+                if let stamp = Self.stamp(candidate) { _ = try codexCursor(path: candidate, stamp: stamp); break }
+            }
         }
     }
 
@@ -1070,11 +1118,19 @@ public actor UsageStore {
     /// backfill bounds with it instead of importing the same session under a second path.
     private func codexCursor(path: String, stamp: FileStamp) throws -> Cursor? {
         if let cursor = try loadCursor(path: path) { return cursor }
-        guard let oldPath = try db.run("SELECT path FROM file_cursor WHERE provider = 'codex' AND inode = ?",
-                                       [.int(stamp.inode)]).compactMap({ $0[0].text }).first(where: {
-                                           ($0 as NSString).lastPathComponent == (path as NSString).lastPathComponent && Self.stamp($0) == nil
-                                       }),
-              let cursor = try loadCursor(path: oldPath) else { return nil }
+        let name = (path as NSString).lastPathComponent
+        let canonical = name.hasSuffix(".zst") ? String(name.dropLast(4)) : name
+        func home(_ path: String) -> String? {
+            let parts = path.split(separator: "/")
+            guard let i = parts.lastIndex(where: { $0 == "sessions" || $0 == "archived_sessions" }) else { return nil }
+            return "/" + parts[..<i].joined(separator: "/")
+        }
+        guard let oldPath = try db.run("SELECT path FROM file_cursor WHERE provider = 'codex'").compactMap({ $0[0].text }).first(where: {
+            let oldName = ($0 as NSString).lastPathComponent
+            let oldCanonical = oldName.hasSuffix(".zst") ? String(oldName.dropLast(4)) : oldName
+            return oldCanonical == canonical && home($0) != nil && home($0) == home(path)
+                && (Self.stamp($0) == nil || (path.hasSuffix(".zst") && !oldName.hasSuffix(".zst")))
+        }), let cursor = try loadCursor(path: oldPath) else { return nil }
         try db.run("UPDATE file_cursor SET path = ? WHERE path = ?", [.text(path), .text(oldPath)])
         for prefix in ["stats_backfill_limit:", "stats_backfill_file:", "long_context_backfill_limit:", "long_context_backfill_file:"] {
             try db.run("UPDATE meta SET key = ? WHERE key = ?", [.text(prefix + path), .text(prefix + oldPath)])
@@ -1094,7 +1150,7 @@ public actor UsageStore {
 
     /// Recursively visits `*.jsonl` files with one stat each, via fts(3): no Foundation
     /// objects per file, which matters with ~100k session files.
-    static func walkJSONL(_ root: String, _ visit: (String, FileStamp) throws -> Void) throws {
+    static func walkJSONL(_ root: String, source: LogSource = .claude, _ visit: (String, FileStamp) throws -> Void) throws {
         guard FileManager.default.fileExists(atPath: root) else { return }
         let rootC = strdup(root)
         defer { free(rootC) }
@@ -1109,9 +1165,13 @@ public actor UsageStore {
             }
             guard info == FTS_F, let st = entry.pointee.fts_statp?.pointee else { continue }
             let path = String(cString: entry.pointee.fts_path)
-            guard path.hasSuffix(".jsonl") else { continue }
+            guard acceptsLog(path, source: source) else { continue }
             try visit(path, FileStamp(st))
         }
+    }
+
+    static func acceptsLog(_ path: String, source: LogSource) -> Bool {
+        path.hasSuffix(".jsonl") || (source == .codex && (path as NSString).lastPathComponent.hasPrefix("rollout-") && path.hasSuffix(".jsonl.zst"))
     }
 
     static func stamp(_ path: String) -> FileStamp? {
@@ -1179,6 +1239,12 @@ enum JSONLReader {
             throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno))
         }
 
+        return try readLines(fd: fd, from: start, until: until, skipping: skipping, body)
+    }
+
+    static func readLines(fd: Int32, from start: Int64, until: Int64? = nil, skipping initialSkipping: Bool = false,
+                          drain: Bool = false, _ body: (UnsafeRawBufferPointer) -> Void) throws -> Int64 {
+        var skipping = initialSkipping
         let capacity = chunkSize + maxLineBytes
         let buf = UnsafeMutableRawPointer.allocate(byteCount: capacity, alignment: 1)
         defer { buf.deallocate() }
@@ -1223,6 +1289,14 @@ enum JSONLReader {
             } else {
                 if rest > 0, lineStart > 0 { memmove(buf, buf + lineStart, rest) }
                 filled = rest
+            }
+        }
+        if drain && reachedLimit {
+            while true {
+                let n = read(fd, buf, capacity)
+                if n < 0 && errno == EINTR { continue }
+                if n < 0 { throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno)) }
+                if n == 0 { break }
             }
         }
         return consumedOffset
