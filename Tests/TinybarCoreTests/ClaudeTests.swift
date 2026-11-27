@@ -174,7 +174,7 @@ private func tempRoot() throws -> (URL, URL) {
                 k.baseAddress, 16, v.baseAddress, p.baseAddress, plain.count, o.baseAddress, capacity, &outLength)
     } } } }
     out.count = outLength
-    #expect(BrowserCookies.aes128CBCDecrypt(out, key: key) == plain)
+    #expect(SafeStorage.aes128CBCDecrypt(out, key: key) == plain)
 }
 
 @Test func joinsChunkedCookies() {
