@@ -148,10 +148,41 @@ private final class CursorSummaryFixture: URLProtocol, @unchecked Sendable {
     override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
     override func stopLoading() {}
     override func startLoading() {
-        #expect(request.url?.path == "/api/usage-summary")
-        let response = HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!
+        let isSand = request.url?.path == "/aiserver.v1.DashboardService/GetSandUsageStatus"
+        let mode = request.value(forHTTPHeaderField: "X-Fixture-Mode")
+        var status = 200
+        let body: String
+        if isSand {
+            #expect(mode != "browser")
+            #expect(request.url?.host == "api2.cursor.sh")
+            #expect(request.httpMethod == "POST")
+            #expect(request.value(forHTTPHeaderField: "Authorization") == "Bearer h.eyJzdWIiOiJhdXRoMHx1c2VyIiwiZXhwIjo0MTAyNDQ0ODAwfQ.sig")
+            #expect(request.value(forHTTPHeaderField: "Content-Type") == "application/json")
+            #expect(request.value(forHTTPHeaderField: "Connect-Protocol-Version") == "1")
+            var bodyData = request.httpBody
+            if bodyData == nil, let stream = request.httpBodyStream {
+                stream.open()
+                defer { stream.close() }
+                var data = Data()
+                var buffer = [UInt8](repeating: 0, count: 1024)
+                while stream.hasBytesAvailable {
+                    let count = stream.read(&buffer, maxLength: buffer.count)
+                    if count <= 0 { break }
+                    data.append(contentsOf: buffer.prefix(count))
+                }
+                bodyData = data
+            }
+            #expect(bodyData == Data("{}".utf8))
+            if mode == "error" { status = 500; body = "error" }
+            else if mode == "malformed" { body = "not json" }
+            else { body = #"{"currentPeriodStart":"2026-09-30T11:50:26Z","nextResetTimestampUtc":"2026-10-07T11:50:26Z","usagePercent":25,"hasNonZeroIncludedLimit":true}"# }
+        } else {
+            #expect(request.url?.path == "/api/usage-summary")
+            body = #"{"membershipType":"pro","individualUsage":{"plan":{"used":10,"limit":100}}}"#
+        }
+        let response = HTTPURLResponse(url: request.url!, statusCode: status, httpVersion: nil, headerFields: nil)!
         client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
-        client?.urlProtocol(self, didLoad: Data(#"{"membershipType":"pro","individualUsage":{"plan":{"used":10,"limit":100}}}"#.utf8))
+        client?.urlProtocol(self, didLoad: Data(body.utf8))
         client?.urlProtocolDidFinishLoading(self)
     }
 }
@@ -165,9 +196,49 @@ private final class CursorSummaryFixture: URLProtocol, @unchecked Sendable {
     let app = CursorProvider(session: session, storedToken: { token }, browserCookie: { _ in nil })
     let snapshot = try await app.fetch()
     #expect(snapshot.plan == "Pro" && snapshot.source == .cli)
+    #expect(snapshot.windows.map(\.id) == ["monthly", "grok-bot"])
+    let grok = try #require(snapshot.windows.last)
+    #expect(grok.title == "Grok Bot" && grok.isModelSpecific && grok.kind == .weekly)
+    #expect(grok.remainingPercent == 75 && grok.durationSeconds == 7 * 86400)
+    #expect(grok.resetsAt == parseISODate("2026-10-07T11:50:26Z"))
+    let browserConfig = URLSessionConfiguration.ephemeral
+    browserConfig.protocolClasses = [CursorSummaryFixture.self]
+    browserConfig.httpAdditionalHeaders = ["X-Fixture-Mode": "browser"]
+    let browserSession = URLSession(configuration: browserConfig)
+    defer { browserSession.invalidateAndCancel() }
     let encrypted = "cursor-safe-storage:v1:djEwQTP6Oq2miYFdXOYlihqY6w=="
-    let fallback = CursorProvider(session: session, storedToken: { encrypted }, browserCookie: { _ in "fixture" },
+    let fallback = CursorProvider(session: browserSession, storedToken: { encrypted }, browserCookie: { _ in "fixture" },
                                   password: { _, _ in nil }, cache: SafeStorage.Cache())
     let browser = try await fallback.fetch()
     #expect(browser.plan == "Pro" && browser.source == .browser)
+    #expect(browser.windows.map(\.id) == ["monthly"])
+}
+
+@Test func cursorGrokMappingEdgeCases() throws {
+    func window(_ json: String) throws -> LimitWindow? {
+        CursorUsageAPI.grokBotWindow(from: try JSONDecoder().decode(CursorUsageAPI.SandUsageStatus.self, from: Data(json.utf8)))
+    }
+    #expect(try window(#"{"usagePercent":150}"#)?.remainingPercent == 0)
+    for json in [#"{"usagePercent":0}"#, #"{"usagePercent":-1}"#, #"{}"#,
+                 #"{"usagePercent":10,"hasNonZeroIncludedLimit":false}"#] {
+        #expect(try window(json) == nil)
+    }
+    let invalidDates = try #require(try window(#"{"usagePercent":10,"currentPeriodStart":"bad","nextResetTimestampUtc":"2026-10-07T11:50:26Z"}"#))
+    #expect(invalidDates.durationSeconds == nil && invalidDates.resetsAt != nil)
+    let reversed = try #require(try window(#"{"usagePercent":10,"currentPeriodStart":"2026-10-08T11:50:26Z","nextResetTimestampUtc":"2026-10-07T11:50:26Z"}"#))
+    #expect(reversed.durationSeconds == nil)
+}
+
+@Test func cursorGrokFailuresPreserveSnapshot() async throws {
+    let token = "h.eyJzdWIiOiJhdXRoMHx1c2VyIiwiZXhwIjo0MTAyNDQ0ODAwfQ.sig"
+    for mode in ["error", "malformed"] {
+        let config = URLSessionConfiguration.ephemeral
+        config.protocolClasses = [CursorSummaryFixture.self]
+        config.httpAdditionalHeaders = ["X-Fixture-Mode": mode]
+        let session = URLSession(configuration: config)
+        defer { session.invalidateAndCancel() }
+        let snapshot = try await CursorProvider(session: session, storedToken: { token }, browserCookie: { _ in nil }).fetch()
+        #expect(snapshot.plan == "Pro" && snapshot.source == .cli)
+        #expect(snapshot.windows.map(\.id) == ["monthly"] && snapshot.windows[0].remainingPercent == 90)
+    }
 }

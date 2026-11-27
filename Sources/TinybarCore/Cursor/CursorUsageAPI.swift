@@ -37,6 +37,13 @@ enum CursorUsageAPI {
         var totalPercentUsed: Double?
     }
 
+    struct SandUsageStatus: Decodable {
+        var currentPeriodStart: String?
+        var nextResetTimestampUtc: String?
+        var usagePercent: Double?
+        var hasNonZeroIncludedLimit: Bool?
+    }
+
     struct Amount: Decodable {
         var enabled: Bool?
         var used: Int?
@@ -62,6 +69,28 @@ enum CursorUsageAPI {
         var snapshot = snapshot(from: summary)
         snapshot.source = source
         return snapshot
+    }
+
+    static func fetchGrokBotWindow(accessToken: String, session: URLSession) async throws -> LimitWindow? {
+        var request = URLRequest(
+            url: URL(string: "https://api2.cursor.sh/aiserver.v1.DashboardService/GetSandUsageStatus")!,
+            cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 10)
+        request.httpMethod = "POST"
+        request.httpBody = Data("{}".utf8)
+        request.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("1", forHTTPHeaderField: "Connect-Protocol-Version")
+        let data = try await HTTP.send(request, session: session, providerName: "Cursor")
+        return grokBotWindow(from: try JSONDecoder().decode(SandUsageStatus.self, from: data))
+    }
+
+    static func grokBotWindow(from status: SandUsageStatus) -> LimitWindow? {
+        guard let usage = status.usagePercent, usage > 0, status.hasNonZeroIncludedLimit != false else { return nil }
+        let start = status.currentPeriodStart.flatMap(parseISODate)
+        let end = status.nextResetTimestampUtc.flatMap(parseISODate)
+        let duration: Int? = if let start, let end, end > start { Int(end.timeIntervalSince(start)) } else { nil }
+        return LimitWindow(id: "grok-bot", title: "Grok Bot", usedPercent: min(max(usage, 0), 100),
+                           resetsAt: end, durationSeconds: duration, isModelSpecific: true)
     }
 
     // MARK: Mapping

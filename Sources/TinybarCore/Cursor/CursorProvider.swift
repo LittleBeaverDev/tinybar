@@ -51,7 +51,11 @@ public struct CursorProvider: UsageProvider {
             }
             if let token, let cookie = CursorAppAuth.cookieHeader(accessToken: token) {
                 do {
-                    return try await CursorUsageAPI.fetch(cookieHeader: cookie, source: .cli, session: session)
+                    var snapshot = try await CursorUsageAPI.fetch(cookieHeader: cookie, source: .cli, session: session)
+                    if let window = try? await CursorUsageAPI.fetchGrokBotWindow(accessToken: token, session: session) {
+                        snapshot.windows.append(window)
+                    }
+                    return snapshot
                 } catch let error as ProviderError {
                     guard error == .loginExpired else { throw error }
                     lastError = error
