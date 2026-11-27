@@ -88,3 +88,86 @@ private func cursorSummary(_ json: String) throws -> ProviderSnapshot {
     #expect(CursorAppAuth.decode(Data("\"tok\"".utf8)) == "tok")
     #expect(CursorAppAuth.decode("tok".data(using: .utf16LittleEndian)!) == "tok")
 }
+
+
+@Test func cursorSafeStorageEnvelopes() throws {
+    let token = "h.eyJzdWIiOiJhdXRoMHx1c2VyIiwiZXhwIjo0MTAyNDQ0ODAwfQ.sig"
+    let encrypted = "cursor-safe-storage:v1:djEwrS58+0ZzxnKlwnrprtUXHpTQg7M/BMxB0PGqdkBF4VxrxljpHxIVU0M9Wk9kxdyVnRakuWpA+JMjsGqGvN2dvg=="
+    var calls = 0
+    let cache = SafeStorage.Cache()
+    let reader: (String, String) -> Data? = { service, account in
+        calls += 1
+        #expect(service == "Cursor Safe Storage" && account == "Cursor Key")
+        return Data("password".utf8)
+    }
+    #expect(try CursorAppAuth.resolve(token, readPassword: reader, cache: cache) == token)
+    #expect(calls == 0)
+    let decrypted = try CursorAppAuth.resolve(encrypted, readPassword: reader, cache: cache)
+    #expect(decrypted == token)
+    #expect(CursorAppAuth.cookieHeader(accessToken: decrypted) == "WorkosCursorSessionToken=user%3A%3A\(token)")
+    #expect(calls == 1)
+    for invalid in ["cursor-safe-storage:v1:%%%", "cursor-safe-storage:v2:AAAA",
+                    "cursor-safe-storage:v1:YWJj", "cursor-safe-storage:v1:djEw", "cursor-safe-storage:v1:djEwAA=="] {
+        #expect(throws: ProviderError.self) { try CursorAppAuth.resolve(invalid, readPassword: reader, cache: cache) }
+    }
+    #expect(calls == 1)
+    for invalid in ["djEwQTP6Oq2miYFdXOYlihqY6w==", "djEwhvJpaPiJc4MkqR82oy2zJQ=="] {
+        #expect(throws: ProviderError.self) { try CursorAppAuth.resolve("cursor-safe-storage:v1:" + invalid, readPassword: reader, cache: cache) }
+    }
+    #expect(throws: ProviderError.self) { try CursorAppAuth.resolve(encrypted, readPassword: { _, _ in Data("wrong".utf8) }, cache: SafeStorage.Cache()) }
+    #expect(throws: ProviderError.loginExpired) {
+        try CursorAppAuth.resolve(token, now: Date(timeIntervalSince1970: 4102444750))
+    }
+}
+
+@Test func cursorDeniedKeyIsCached() async {
+    let cache = SafeStorage.Cache()
+    let calls = CursorPasswordCalls()
+    let stored = "cursor-safe-storage:v1:djEwQTP6Oq2miYFdXOYlihqY6w=="
+    let provider = CursorProvider(storedToken: { stored }, browserCookie: { _ in nil },
+                                  password: { _, _ in calls.increment(); return nil }, cache: cache)
+    for _ in 0..<2 {
+        do { _ = try await provider.fetch(); Issue.record("Expected Keychain error") }
+        catch let error as ProviderError {
+            if case .unexpected = error {} else { Issue.record("Expected unexpected error") }
+        } catch { Issue.record("Unexpected error") }
+    }
+    #expect(calls.count == 1)
+}
+
+private final class CursorPasswordCalls: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value = 0
+    var count: Int { lock.lock(); defer { lock.unlock() }; return value }
+    func increment() { lock.lock(); defer { lock.unlock() }; value += 1 }
+}
+
+
+private final class CursorSummaryFixture: URLProtocol, @unchecked Sendable {
+    override class func canInit(with request: URLRequest) -> Bool { true }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+    override func stopLoading() {}
+    override func startLoading() {
+        #expect(request.url?.path == "/api/usage-summary")
+        let response = HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!
+        client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+        client?.urlProtocol(self, didLoad: Data(#"{"membershipType":"pro","individualUsage":{"plan":{"used":10,"limit":100}}}"#.utf8))
+        client?.urlProtocolDidFinishLoading(self)
+    }
+}
+
+@Test func cursorFetchesAppAndFallsBackAfterDenial() async throws {
+    let config = URLSessionConfiguration.ephemeral
+    config.protocolClasses = [CursorSummaryFixture.self]
+    let session = URLSession(configuration: config)
+    defer { session.invalidateAndCancel() }
+    let token = "h.eyJzdWIiOiJhdXRoMHx1c2VyIiwiZXhwIjo0MTAyNDQ0ODAwfQ.sig"
+    let app = CursorProvider(session: session, storedToken: { token }, browserCookie: { _ in nil })
+    let snapshot = try await app.fetch()
+    #expect(snapshot.plan == "Pro" && snapshot.source == .cli)
+    let encrypted = "cursor-safe-storage:v1:djEwQTP6Oq2miYFdXOYlihqY6w=="
+    let fallback = CursorProvider(session: session, storedToken: { encrypted }, browserCookie: { _ in "fixture" },
+                                  password: { _, _ in nil }, cache: SafeStorage.Cache())
+    let browser = try await fallback.fetch()
+    #expect(browser.plan == "Pro" && browser.source == .browser)
+}
