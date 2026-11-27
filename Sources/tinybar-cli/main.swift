@@ -102,6 +102,10 @@ func ingest() async throws {
             FileHandle.standardError.write("  \(p.filesDone)/\(p.filesTotal)\n".data(using: .utf8)!)
         }
     }
+    if let token = try? CursorProvider.activityAccessToken() {
+        do { try await store.syncCursorUsage(accessToken: token) }
+        catch { FileHandle.standardError.write(Data("Cursor activity sync failed: \(error.localizedDescription)\n".utf8)) }
+    }
     print(String(format: "files=%d bytes=%.1fMB records=%d in %.1fs",
                  r.filesScanned, Double(r.bytesRead) / 1e6, r.recordsAdded, Date().timeIntervalSince(start)))
 }

@@ -72,6 +72,8 @@ struct SplitNumber: View {
         let number = value.formatted(.number)
         let size = min(96, TokensHero.fontSize(max(sizedTo, value).formatted(.number), width: width))
         let claude = TokensHero.split(number, share: Double(byProvider[.claude] ?? 0) / Double(max(value, 1)))
+        let geminiEnd = TokensHero.split(number, share: Double((byProvider[.claude] ?? 0) + (byProvider[.gemini] ?? 0)) / Double(max(value, 1)))
+        let cursorEnd = TokensHero.split(number, share: Double((byProvider[.claude] ?? 0) + (byProvider[.gemini] ?? 0) + (byProvider[.cursor] ?? 0)) / Double(max(value, 1)))
         VStack(alignment: .leading, spacing: 2) {
             Text(number)
                 .font(.system(size: size, weight: .heavy).width(.compressed))
@@ -81,7 +83,11 @@ struct SplitNumber: View {
                     stops: [
                         .init(color: palette.claude, location: 0),
                         .init(color: palette.claude, location: claude),
-                        .init(color: palette.ink, location: claude),
+                        .init(color: palette.color(.gemini), location: claude),
+                        .init(color: palette.color(.gemini), location: geminiEnd),
+                        .init(color: palette.color(.cursor), location: geminiEnd),
+                        .init(color: palette.color(.cursor), location: cursorEnd),
+                        .init(color: palette.ink, location: cursorEnd),
                         .init(color: palette.ink, location: 1),
                     ],
                     startPoint: .leading, endPoint: .trailing))
@@ -100,7 +106,7 @@ struct SplitNumber: View {
                         Text("\(ModelName.display(model.name)) only")
                     }
                 } else {
-                    ForEach([ProviderID.claude, .codex], id: \.self) { id in
+                    ForEach(ProviderID.allCases.filter(\.hasActivity), id: \.self) { id in
                         if let t = byProvider[id], t > 0 {
                         HStack(spacing: 5) {
                             Circle().fill(palette.color(id)).frame(width: 7, height: 7)
@@ -180,13 +186,13 @@ struct RankedChart: View {
 
     var body: some View {
         let ranked = metric.ranked(summary.models)
-        let picked = summary.model
-        let pickedHere = picked.map { p in ranked.contains { $0.model.name == p } } ?? false
+        let picked = summary.pickedModel?.id
+        let pickedHere = picked.map { p in ranked.contains { $0.model.id == p } } ?? false
         let missing = pickedHere ? nil : summary.pickedModel
         var shown = Array(ranked.prefix(max(rows - (missing == nil ? 0 : 1), 0)))
         // A picked model below the top rows takes the last one.
-        if let picked, pickedHere, !shown.contains(where: { $0.model.name == picked }),
-           let entry = ranked.first(where: { $0.model.name == picked }), !shown.isEmpty
+        if let picked, pickedHere, !shown.contains(where: { $0.model.id == picked }),
+           let entry = ranked.first(where: { $0.model.id == picked }), !shown.isEmpty
         {
             shown[shown.count - 1] = entry
         }
@@ -196,7 +202,7 @@ struct RankedChart: View {
                 .statsTip(StatsTip(id: "chart:\(metric.rawValue)", title: title, note: note))
                 .padding(.bottom, 2)
             ForEach(Array(shown.enumerated()), id: \.element.model.id) { _, entry in
-                row(entry.model, entry.value, top: top, dimmed: pickedHere && entry.model.name != picked)
+                row(entry.model, entry.value, top: top, dimmed: pickedHere && entry.model.id != picked)
             }
             ForEach(shown.count..<rows, id: \.self) { i in
                 if i == rows - 1, let missing {
@@ -219,7 +225,7 @@ struct RankedChart: View {
         let color = palette.color(m.provider)
         let python = metric.pythonPart(m)
         let isPicked = summary.model == m.name
-        let id = "rank:\(metric.rawValue):\(m.name)"
+        let id = "rank:\(metric.rawValue):\(m.id)"
         let label = HStack(spacing: 6) {
             Circle().fill(color).frame(width: 6, height: 6)
             Text(ModelName.display(m.name))
@@ -257,7 +263,7 @@ struct RankedChart: View {
         }
         .padding(.horizontal, -5)
         if let pick {
-            Button { pick(m.name) } label: { label.contentShape(Rectangle()) }
+            Button { pick(m) } label: { label.contentShape(Rectangle()) }
                 .buttonStyle(.plain)
                 .statsTip(StatsTip(
                     id: id, title: ModelName.display(m.name),
@@ -282,7 +288,7 @@ private struct UnrankedModelRow: View {
             Text("too little data").font(.system(size: 11)).foregroundStyle(palette.ink3)
         }
         if let pick {
-            Button { pick(model.name) } label: { label.contentShape(Rectangle()) }
+            Button { pick(model) } label: { label.contentShape(Rectangle()) }
                 .buttonStyle(.plain)
                 .help("Click to show all models again.")
         } else {
@@ -292,7 +298,10 @@ private struct UnrankedModelRow: View {
 }
 
 extension StatsSummary {
-    var pickedModel: Model? { model.flatMap { m in models.first { $0.name == m } } }
+    func isPicked(_ item: Model) -> Bool {
+        item.name == model && (modelProvider == nil || item.provider == modelProvider)
+    }
+    var pickedModel: Model? { models.first { isPicked($0) } }
 }
 
 enum StatsFormat {
@@ -637,14 +646,14 @@ private struct LanguageMix: View {
         let keyLanguages = totals.filter { LanguageColor.color($0.key, palette) != palette.ink.opacity(0.32) }
             .sorted { $0.value > $1.value }.prefix(Self.coloured).map(\.key)
         mixes.sort { $0.total > $1.total }
-        let missing = summary.pickedModel.flatMap { m in mixes.contains { $0.model.name == m.name } ? nil : m }
+        let missing = summary.pickedModel.flatMap { m in mixes.contains { $0.model.id == m.id } ? nil : m }
         var shown = Array(mixes.prefix(Self.rows - (missing == nil ? 0 : 1)))
-        if let picked = summary.model, !shown.contains(where: { $0.model.name == picked }),
-           let entry = mixes.first(where: { $0.model.name == picked }), !shown.isEmpty
+        if let picked = summary.pickedModel?.id, !shown.contains(where: { $0.model.id == picked }),
+           let entry = mixes.first(where: { $0.model.id == picked }), !shown.isEmpty
         {
             shown[shown.count - 1] = entry
         }
-        let pickedHere = summary.model.map { p in shown.contains { $0.model.name == p } } ?? false
+        let pickedHere = summary.pickedModel.map { p in shown.contains { $0.model.id == p.id } } ?? false
         return VStack(alignment: .leading, spacing: 4) {
             SectionTitle(text: "What each model writes", palette: palette)
                 .statsTip(StatsTip(
@@ -652,7 +661,7 @@ private struct LanguageMix: View {
                     note: "Each model's lines added, split by language. The six most written languages have their colour; the rest are grey. Shown from 50 lines."))
                 .padding(.bottom, 2)
             ForEach(shown, id: \.model.id) { entry in
-                row(entry.model, entry.parts, entry.total, keyLanguages, dimmed: pickedHere && entry.model.name != summary.model)
+                row(entry.model, entry.parts, entry.total, keyLanguages, dimmed: pickedHere && !summary.isPicked(entry.model))
             }
             ForEach(shown.count..<Self.rows, id: \.self) { i in
                 if i == Self.rows - 1, let missing {
@@ -673,7 +682,7 @@ private struct LanguageMix: View {
         let rest = total - keys.reduce(0) { $0 + (parts[$1] ?? 0) }
         let segments = keys.map { (LanguageColor.color($0, palette), parts[$0] ?? 0) } + [(palette.ink.opacity(0.16), rest)]
         let isPicked = summary.model == m.name
-        let id = "mix:\(m.name)"
+        let id = "mix:\(m.id)"
         let label = HStack(spacing: 6) {
             Circle().fill(palette.color(m.provider)).frame(width: 6, height: 6)
             Text(ModelName.display(m.name))
@@ -709,7 +718,7 @@ private struct LanguageMix: View {
         .padding(.horizontal, -5)
         if let pick {
             let top = parts.sorted { $0.value > $1.value }.prefix(5)
-            Button { pick(m.name) } label: { label.contentShape(Rectangle()) }
+            Button { pick(m) } label: { label.contentShape(Rectangle()) }
                 .buttonStyle(.plain)
                 .statsTip(StatsTip(
                     id: id, title: ModelName.display(m.name),

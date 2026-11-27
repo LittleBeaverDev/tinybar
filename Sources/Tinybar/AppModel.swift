@@ -65,6 +65,8 @@ final class AppModel {
     var isRefreshing: Bool { isFetching || usageTask != nil }
     private var isFetching = false
     private var usageTask: Task<Void, Never>?
+    private var cursorUsageTask: Task<Void, Never>?
+    private var pendingUsageRefresh = false
 
     let settings: Settings
     let updater = Updater()
@@ -91,7 +93,7 @@ final class AppModel {
 
     init(settings: Settings) {
         self.settings = settings
-        logRoots = UsageStore.codexRoots + UsageStore.claudeRoots
+        logRoots = UsageStore.logRoots
         logWatcher = LogWatcher(roots: logRoots)
         let browserFlags = settings.browserFallbackFlags
         sources = [
@@ -287,14 +289,31 @@ final class AppModel {
             notifier.send(update: release)
         }
         guard !isAsleep, !isLocked else { return nil }
-        if usageTask == nil {
-            usageTask = Task {
+        startUsageRefresh()
+        return usageTask
+    }
+
+    private func startUsageRefresh() {
+        guard usageTask == nil else { return }
+        usageTask = Task {
+            repeat {
+                pendingUsageRefresh = false
                 await refreshUsage()
                 lastUpdated = Date()
-                usageTask = nil
-            }
+            } while pendingUsageRefresh
+            usageTask = nil
         }
-        return usageTask
+    }
+
+    func setCursorRemoteUsage(_ enabled: Bool) {
+        guard settings.cursorRemoteUsage != enabled else { return }
+        settings.cursorRemoteUsage = enabled
+        if enabled {
+            if usageTask != nil { pendingUsageRefresh = true }
+            else { startUsageRefresh() }
+        } else {
+            cursorUsageTask?.cancel()
+        }
     }
 
     /// Reads the status pages of the enabled subscriptions that have one. A page that can't be
@@ -537,7 +556,7 @@ final class AppModel {
         // A log folder its import didn't finish is as heavy as an initial import, so it waits too.
         if !initialImportFailed, (try? await store.unreadLogRoots().isEmpty) ?? true {
             // A login folder or `cswap run` profile that appeared gets watched and read from now on.
-            let roots = UsageStore.codexRoots + UsageStore.claudeRoots
+            let roots = UsageStore.logRoots
             if roots != logRoots {
                 logRoots = roots
                 logWatcher = LogWatcher(roots: roots)
@@ -559,6 +578,13 @@ final class AppModel {
         }
 
         guard !isAsleep, !isLocked else { return }
+        if enabledProviders.contains(.cursor), settings.cursorRemoteUsage,
+           let token = try? CursorProvider.activityAccessToken() {
+            let task = Task<Void, Never> { try? await store.syncCursorUsage(accessToken: token) }
+            cursorUsageTask = task
+            await task.value
+            cursorUsageTask = nil
+        }
         prices = await pricing.refreshIfNeeded()
         guard !isAsleep, !isLocked else { return }
         usageRows = (try? await store.daily(since: DayKey.daysAgo(UsageRange.month.days - 1))) ?? []
@@ -625,7 +651,7 @@ final class AppModel {
 
     /// Reads what the Stats window shows for a range. Only runs while that window is open; nothing
     /// is kept afterwards.
-    func statsSummary(_ range: StatsRange, model: String? = nil) async -> StatsSummary? {
+    func statsSummary(_ range: StatsRange, model: String? = nil, provider: ProviderID? = nil) async -> StatsSummary? {
         guard let store else { return nil }
         let since = range.days.map { DayKey.daysAgo($0 - 1) } ?? "0000"
         do {
@@ -633,9 +659,9 @@ final class AppModel {
             let stats = try await store.stats(since: since)
             // All time starts at the first day of any model, so the model list stays complete.
             let days = try await store.activeDays()
-            let modelDays = model == nil ? nil : try await store.activeDays(model: model)
+            let modelDays = model == nil ? nil : try await store.activeDays(model: model, provider: provider)
             var summary = StatsSummary.build(
-                usage: usage, stats: stats, allDays: days, streakDays: modelDays, range: range, model: model, prices: prices)
+                usage: usage, stats: stats, allDays: days, streakDays: modelDays, range: range, model: model, modelProvider: provider, prices: prices)
             if CommandLine.arguments.contains("--redact-projects") {
                 for i in summary.topProjects.indices {
                     summary.topProjects[i].name = "Project \(i + 1)"
@@ -810,6 +836,7 @@ final class AppModel {
             if isFetching { pendingRefreshThrottle = pendingRefreshThrottle ?? Self.openThrottle }
             else { Task { await refresh(force: false, throttle: Self.openThrottle) } }
         } else if let state = providers.removeValue(forKey: id) {
+            if id == .cursor { cursorUsageTask?.cancel() }
             disabledProviders[id] = state
         }
     }

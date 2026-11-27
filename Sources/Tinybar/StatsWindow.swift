@@ -78,6 +78,7 @@ struct StatsView: View {
     @AppStorage("statsPage") private var pageRaw = StatsPage.overview.rawValue
     /// The one model the card is filtered to, if any. Not remembered: the window opens on all models.
     @State private var picked: String?
+    @State private var pickedProvider: ProviderID?
     @State private var summary: StatsSummary?
     @State private var summaryRevision = 0
     @State private var loadFailed = false
@@ -124,8 +125,10 @@ struct StatsView: View {
             .frame(height: 52)
 
             StatsCard(summary: summary, importing: model.importProgress, palette: palette, page: page, plans: model.plans,
-                      forward: forward, loadFailed: loadFailed, summaryRevision: summaryRevision) { name in
-                picked = picked == name ? nil : name
+                      forward: forward, loadFailed: loadFailed, summaryRevision: summaryRevision) { item in
+                let same = picked == item.name && pickedProvider == item.provider
+                picked = same ? nil : item.name
+                pickedProvider = same ? nil : item.provider
             }
         }
         .background(palette.canvas)
@@ -133,14 +136,14 @@ struct StatsView: View {
         // to the rendered selection so clicks, shortcuts and preference updates animate alike.
         .animation(reduceMotion ? .easeInOut(duration: 0.2) : .smooth(duration: 0.35), value: page)
         .onExitCommand { picked = nil }
-        .task(id: "\(rangeRaw)|\(picked ?? "")|\(model.lastUpdated?.timeIntervalSince1970 ?? 0)|\(model.isRefreshing)") {
+        .task(id: "\(rangeRaw)|\(picked ?? "")|\(pickedProvider?.rawValue ?? "")|\(model.lastUpdated?.timeIntervalSince1970 ?? 0)|\(model.isRefreshing)") {
             guard !model.isRefreshing else { return }
-            let next = await model.statsSummary(range, model: picked)
+            let next = await model.statsSummary(range, model: picked, provider: pickedProvider)
             guard !Task.isCancelled else { return }
             guard let next else { loadFailed = true; return }
             loadFailed = false
             // A model not used in the new range has nothing to show: fall back to all models.
-            if let p = picked, !next.models.contains(where: { $0.name == p }) {
+            if let p = picked, !next.models.contains(where: { $0.name == p && (pickedProvider == nil || $0.provider == pickedProvider) }) {
                 picked = nil
                 return
             }
@@ -206,7 +209,7 @@ struct StatsPalette {
     }
 
     func color(_ provider: ProviderID) -> Color {
-        provider == .claude ? claude : ink
+        provider == .claude ? claude : (provider == .gemini ? ProviderID.Gemini.blue : (provider == .cursor ? .gray : ink))
     }
 }
 
@@ -226,7 +229,7 @@ struct StatsCard: View {
     var loadFailed = false
     var summaryRevision = 0
     /// Filters to a model, or back to all. Nil for the copied image, which is not interactive.
-    var pick: ((String) -> Void)?
+    var pick: ((StatsSummary.Model) -> Void)?
     @State private var tip: StatsTip?
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
@@ -258,7 +261,7 @@ struct StatsCard: View {
             } else if summary != nil {
                 VStack(spacing: 6) {
                     Text("Nothing to count yet").font(.system(size: 17, weight: .semibold))
-                    Text("Stats come from Claude Code and Codex logs. Run a session and they show up here.")
+                    Text("Stats come from local activity and Cursor usage events. Run a session and they show up here.")
                         .font(.system(size: 13))
                         .foregroundStyle(palette.ink2)
                 }
@@ -394,7 +397,7 @@ struct TipSink {
 extension EnvironmentValues {
     @Entry var statsTip: TipSink?
     @Entry var statsTipID: String?
-    @Entry var statsPick: ((String) -> Void)?
+    @Entry var statsPick: ((StatsSummary.Model) -> Void)?
 }
 
 extension View {
@@ -636,7 +639,7 @@ struct TokensHero: View {
                 }
             }
             HStack(spacing: 14) {
-                ForEach([ProviderID.claude, .codex], id: \.self) { id in
+                ForEach(ProviderID.allCases.filter(\.hasActivity), id: \.self) { id in
                     if let t = summary.tokensByProvider[id], t > 0 {
                         HStack(spacing: 5) {
                             Circle().fill(palette.color(id)).frame(width: 7, height: 7)
@@ -885,7 +888,7 @@ private struct ToolBars: View {
                         .frame(width: 96, alignment: .leading)
                     GeometryReader { geo in
                         HStack(spacing: 0) {
-                            ForEach([ProviderID.claude, .codex], id: \.self) { id in
+                            ForEach(ProviderID.allCases.filter(\.hasActivity), id: \.self) { id in
                                 let v = tool.byProvider[id] ?? 0
                                 if v > 0 {
                                     Rectangle()
@@ -938,8 +941,8 @@ private struct ModelTable: View {
     var body: some View {
         let top = Array(summary.models.prefix(Self.rows))
         // A model picked from the full list gets the row below the top ones, kept free for it.
-        let extra = summary.model.flatMap { picked in
-            top.contains { $0.name == picked } ? nil : summary.models.first { $0.name == picked }
+        let extra = summary.model.flatMap { _ in
+            top.contains { summary.isPicked($0) } ? nil : summary.models.first { summary.isPicked($0) }
         }
         return VStack(alignment: .leading, spacing: 3) {
             HStack(alignment: .firstTextBaseline, spacing: 8) {
@@ -951,7 +954,7 @@ private struct ModelTable: View {
                         .foregroundStyle(palette.ink2)
                         .help("Every model in this range")
                         .popover(isPresented: $showsAll, arrowEdge: .trailing) {
-                            AllModels(models: summary.models, picked: summary.model) { name in
+                            AllModels(models: summary.models, picked: summary.pickedModel?.id) { name in
                                 showsAll = false
                                 pick(name)
                             }
@@ -979,18 +982,18 @@ private struct ModelTable: View {
     @ViewBuilder
     private func row(_ m: StatsSummary.Model?) -> some View {
         if let m {
-            let picked = summary.model == m.name
+            let picked = summary.isPicked(m)
             let label = ModelRow(model: m, palette: palette)
                 .opacity(summary.model != nil && !picked ? 0.38 : 1)
                 .padding(.vertical, 2.5)
                 .padding(.horizontal, 6)
                 .background {
                     RoundedRectangle(cornerRadius: 6, style: .continuous)
-                        .fill(palette.ink.opacity(picked ? 0.08 : lit == "model:\(m.name)" ? 0.05 : 0))
+                        .fill(palette.ink.opacity(picked ? 0.08 : lit == "model:\(m.id)" ? 0.05 : 0))
                 }
                 .padding(.horizontal, -6)
             if let pick {
-                Button { pick(m.name) } label: { label.contentShape(Rectangle()) }
+                Button { pick(m) } label: { label.contentShape(Rectangle()) }
                     .buttonStyle(.plain)
                     .statsTip(StatsText.modelTip(m, total: summary.allTokens, picked: picked))
             } else {
@@ -1028,14 +1031,14 @@ private struct ModelRow: View {
 private struct AllModels: View {
     let models: [StatsSummary.Model]
     let picked: String?
-    let pick: (String) -> Void
+    let pick: (StatsSummary.Model) -> Void
     @Environment(\.colorScheme) private var scheme
 
     var body: some View {
         let palette = StatsPalette(scheme)
         ScrollView {
             VStack(alignment: .leading, spacing: 14) {
-                ForEach([ProviderID.claude, .codex], id: \.self) { id in
+                ForEach(ProviderID.allCases.filter(\.hasActivity), id: \.self) { id in
                     let mine = models.filter { $0.provider == id }
                     if !mine.isEmpty {
                         VStack(alignment: .leading, spacing: 2) {
@@ -1050,13 +1053,13 @@ private struct AllModels: View {
                             .padding(.horizontal, 8)
                             .padding(.bottom, 2)
                             ForEach(mine) { m in
-                                Button { pick(m.name) } label: {
+                                Button { pick(m) } label: {
                                     ModelRow(model: m, palette: palette)
                                         .padding(.horizontal, 8)
                                         .padding(.vertical, 4)
                                         .contentShape(Rectangle())
                                 }
-                                .buttonStyle(AllModelsRowStyle(picked: picked == m.name))
+                                .buttonStyle(AllModelsRowStyle(picked: picked == m.id))
                             }
                         }
                     }
@@ -1263,7 +1266,7 @@ enum StatsText {
     static let speedNote = "Output tokens per second, averaged over responses of 200 tokens or more, each timed from sending the request to its last token. Shown once a model has 10 of them."
 
     static func byProvider(_ counts: [ProviderID: Int64]) -> [StatsTip.Row] {
-        [ProviderID.claude, .codex].compactMap { id in
+        ProviderID.allCases.filter(\.hasActivity).compactMap { id in
             guard let v = counts[id], v > 0 else { return nil }
             return .init(label: id.displayName, value: v.formatted(.number), provider: id)
         }
@@ -1331,7 +1334,7 @@ enum StatsText {
         }
         if m.peakContext > 0 { rows.append(.init(label: "Peak context", value: m.peakContext.formatted(.number))) }
         return StatsTip(
-            id: "model:\(m.name)", title: ModelName.display(m.name), rows: rows,
+            id: "model:\(m.id)", title: ModelName.display(m.name), rows: rows,
             note: picked ? "Click to show all models again." : "Click to show only this model.")
     }
 }

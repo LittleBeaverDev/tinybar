@@ -18,6 +18,18 @@ public enum Paths {
         return home.appendingPathComponent(folder, isDirectory: true)
     }
 
+    public static func agyHome(home: URL = Paths.home) -> URL {
+        home.appendingPathComponent(".gemini/antigravity-cli", isDirectory: true)
+    }
+
+    public static func agyBrain(home: URL = Paths.home) -> URL {
+        agyHome(home: home).appendingPathComponent("brain", isDirectory: true)
+    }
+
+    public static func agySummaries(home: URL = Paths.home) -> URL {
+        agyHome(home: home).appendingPathComponent("conversation_summaries.db")
+    }
+
     public static func codexHome(env: [String: String] = ProcessInfo.processInfo.environment) -> URL {
         cliHome("CODEX_HOME", default: ".codex", env: env)
     }
@@ -159,6 +171,11 @@ public enum Paths {
         let others = (extraConfigDirs(.claude, home: home, env: env, added: added) + ClaudeSwap.sessionFolders(home: home))
             .map { $0.appendingPathComponent("projects", isDirectory: true) }
         return unique(claudeConfigDirs(env: env).map { $0.appendingPathComponent("projects", isDirectory: true) } + others.filter(exists).map { $0.resolvingSymlinksInPath() })
+    }
+
+    /// pi session logs are separate from the legacy default roots used by upgraded stores.
+    public static func piLogRoots(home: URL = Paths.home) -> [URL] {
+        [home.appendingPathComponent(".pi/agent/sessions", isDirectory: true)]
     }
 
     /// Every place the Codex CLI logs, the default first.

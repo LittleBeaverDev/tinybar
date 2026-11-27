@@ -1241,8 +1241,8 @@ private struct SettingsPage: View {
         @Bindable var settings = model.settings
         VStack(alignment: .leading, spacing: 18) {
             SettingsSection("Subscriptions", footer: "Tinybar turns on each subscription it finds a login for.") {
-                ForEach(ProviderID.allCases, id: \.self) { id in
-                    SubscriptionRow(model: model, id: id, first: id == ProviderID.allCases.first) { open(id) }
+                ForEach(ProviderID.subscriptionProviders, id: \.self) { id in
+                    SubscriptionRow(model: model, id: id, first: id == ProviderID.subscriptionProviders.first) { open(id) }
                 }
             }
             OtherLoginsSection(model: model)
@@ -1350,6 +1350,15 @@ private struct SubscriptionPage: View {
             {
                 SettingsToggle(isOn: Binding(get: { model.providers[id] != nil }, set: { model.setEnabled(id, $0) }), first: true) {
                     Text("Show \(id.displayName)")
+                }
+            }
+            if id == .cursor {
+                SettingsSection("Usage history", footer: "Uses the Cursor app login to fetch usage events for Usage & Stats. Turning this off keeps imported history and does not affect Cursor limits.") {
+                    SettingsToggle(isOn: Binding(
+                        get: { settings.cursorRemoteUsage },
+                        set: { model.setCursorRemoteUsage($0) }), first: true) {
+                        Text("Sync Cursor usage history")
+                    }
                 }
             }
             if LoginFolderKind.of(id) != nil {

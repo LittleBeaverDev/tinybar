@@ -782,9 +782,9 @@ private func openCodeStatus(go: String, reason: String = "none", free: String = 
     }
     let summary = StatsSummary.build(
         usage: [row(.claude, 10), row(.opencode, 1000)], stats: [], allDays: [day], range: .week, prices: .empty)
-    #expect(summary.tokens == 10)
-    #expect(summary.tokensByProvider[.opencode] == nil)
-    #expect(summary.activityCoverage[.opencode] == nil)
+    #expect(summary.tokens == 1010)
+    #expect(summary.tokensByProvider[.opencode] == 1000)
+    #expect(summary.activityCoverage[.opencode] == 0)
 }
 
 @Test func statsDaysLeaveOutProvidersWithoutActivity() async throws {
@@ -795,12 +795,12 @@ private func openCodeStatus(go: String, reason: String = "none", free: String = 
     let store = try fixture.store()
     try await store.ingestOpenCode(database: fixture.database)
     #expect(try await totals(store).count == 1)
-    #expect(try await store.activeDays().isEmpty)
-    #expect(try await store.activeDays(model: "glm-5.2").isEmpty)
+    #expect(try await !store.activeDays().isEmpty)
+    #expect(try await !store.activeDays(model: "glm-5.2").isEmpty)
 }
 
 @Test func openCodeSubscriptionIsAProvider() {
-    #expect(StatusFeed.hasFeed(.opencode) && !ProviderID.opencode.hasBrowserFallback && !ProviderID.opencode.hasActivity)
+    #expect(StatusFeed.hasFeed(.opencode) && !ProviderID.opencode.hasBrowserFallback && ProviderID.opencode.hasActivity)
     #expect(ProviderID.opencode.loginHint == "run `opencode auth login`")
 }
 
@@ -817,7 +817,7 @@ private func openCodeStatus(go: String, reason: String = "none", free: String = 
     INSERT INTO daily_long_context VALUES ('2026-09-25', 'codex', 'kept', '', 272000, 5, 5, 5, 5);
     """)
     _ = try fixture.store()
-    #expect(try db.run("PRAGMA user_version").first?.first?.int == 9)
+    #expect(try db.run("PRAGMA user_version").first?.first?.int == 11)
     #expect(try db.run("SELECT count(*) FROM opencode_message").first?.first?.int == 0)
     #expect(try db.run("SELECT model FROM daily_long_context").map { $0[0].text } == ["kept"])
 }

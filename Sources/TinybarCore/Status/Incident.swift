@@ -108,6 +108,7 @@ public enum StatusFeed {
         // Also counts "Copilot AI Model Providers". Git, Actions and the rest say nothing about it.
         case .copilot: .statuspage(URL(string: "https://www.githubstatus.com")!, components: ["Copilot"])
         case .grok: .xAI(URL(string: "https://status.x.ai")!)
+        case .piOther: nil
         }
     }
 

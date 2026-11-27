@@ -37,7 +37,7 @@ public struct DailyStat: Sendable, Hashable {
 public actor UsageStore {
     private let db: SQLiteDB
     private let projects = ProjectResolver()
-    private static let schemaVersion: Int64 = 9
+    private static let schemaVersion: Int64 = 11
 
     public init(path: URL = Paths.appSupport.appendingPathComponent("usage.sqlite")) throws {
         let db = try SQLiteDB(path: path.path)
@@ -52,6 +52,16 @@ public actor UsageStore {
     private static func migrate(_ db: SQLiteDB) throws {
         let version = try db.run("PRAGMA user_version").first?.first?.int ?? 0
         guard version < schemaVersion else { return }
+        try db.exec("CREATE TABLE IF NOT EXISTS cursor_usage_event (id TEXT PRIMARY KEY, timestamp_ms INTEGER NOT NULL) WITHOUT ROWID;")
+        if version == 10 {
+            try db.exec("PRAGMA user_version = 11;")
+            return
+        }
+        try db.exec("CREATE TABLE IF NOT EXISTS pi_message (id TEXT PRIMARY KEY, day TEXT NOT NULL, provider TEXT NOT NULL, model TEXT NOT NULL, context INTEGER NOT NULL) WITHOUT ROWID;")
+        if version == 9 {
+            try db.exec("PRAGMA user_version = 11;")
+            return
+        }
         if version == 7 || version == 8 {
             // 0.9.0 keeps readings per Account. The ones so far can mix Accounts, so they stay
             // unclaimed (SPEC §14).
@@ -233,14 +243,19 @@ public actor UsageStore {
     public static var codexRoots: [URL] { Paths.codexLogRoots() }
 
     public static var claudeRoots: [URL] { Paths.claudeLogRoots() }
+    public static var piRoots: [URL] { Paths.piLogRoots() }
+    public static var geminiRoots: [URL] { [Paths.agyBrain()] }
+    public static var logRoots: [URL] { codexRoots + claudeRoots + piRoots + geminiRoots }
 
     public enum LogSource: String, Sendable, CaseIterable {
-        case codex, claude
+        case codex, claude, pi, gemini
 
         public var roots: [URL] {
             switch self {
             case .codex: UsageStore.codexRoots
             case .claude: UsageStore.claudeRoots
+            case .pi: UsageStore.piRoots
+            case .gemini: UsageStore.geminiRoots
             }
         }
     }
@@ -281,6 +296,18 @@ public actor UsageStore {
         progress: (@Sendable (IngestProgress) -> Void)? = nil) throws -> IngestResult
     {
         try ingest(.claude, roots: roots, only: only, progress: progress)
+    }
+
+    @discardableResult
+    public func ingestPi(roots: [URL] = UsageStore.piRoots, only: Set<String>? = nil,
+                         progress: (@Sendable (IngestProgress) -> Void)? = nil) throws -> IngestResult {
+        try ingest(.pi, roots: roots, only: only, progress: progress)
+    }
+
+    @discardableResult
+    public func ingestGemini(roots: [URL] = UsageStore.geminiRoots, only: Set<String>? = nil,
+                             progress: (@Sendable (IngestProgress) -> Void)? = nil) throws -> IngestResult {
+        try ingest(.gemini, roots: roots, only: only, progress: progress)
     }
 
     /// OpenCode's database and WAL at the last good read, to skip reading them unchanged.
@@ -363,14 +390,22 @@ public actor UsageStore {
         var changed: [(String, FileStamp)] = []
         if let only {
             let rootPaths = roots.map { $0.path + "/" }
-            for path in only where path.hasSuffix(".jsonl") && rootPaths.contains(where: path.hasPrefix) {
+            for path in only where Self.acceptsLog(path, source: source) && rootPaths.contains(where: { prefix in
+                path.hasPrefix(prefix) && (source != .gemini || path.dropFirst(prefix.count).split(separator: "/").count == 4)
+            }) {
                 if let stamp = Self.stamp(path), try isChanged(path, stamp) { changed.append((path, stamp)) }
             }
         } else {
             for root in roots {
-                try Self.walkJSONL(root.path) { path, stamp in
+                try Self.walkJSONL(root.path, source: source) { path, stamp in
+                    if source == .gemini && path.dropFirst(root.path.count + 1).split(separator: "/").count != 4 { return }
                     if try isChanged(path, stamp) { changed.append((path, stamp)) }
                 }
+            }
+        }
+        if source == .codex {
+            changed.removeAll { path, _ in
+                path.hasSuffix(".jsonl.zst") && Self.stamp(String(path.dropLast(4))) != nil
             }
         }
         // Oldest first, so a fork's parent is ingested before the fork when both are new.
@@ -381,14 +416,35 @@ public actor UsageStore {
         var index = 0
         while index < changed.count {
             let batch = changed[index..<min(index + batchSize, changed.count)]
+            var maps: [String: AgyProjectMap] = [:]
+            if source == .gemini {
+                for root in roots {
+                    maps[root.path] = AgyProjectMap(database: root.deletingLastPathComponent().appendingPathComponent("conversation_summaries.db"), resolver: projects)
+                }
+            }
             try db.transaction {
                 for (path, stamp) in batch {
-                    let (read, added) = try autoreleasepool {
-                        let cursor = try source == .codex ? codexCursor(path: path, stamp: stamp) : loadCursor(path: path)
-                        switch source {
-                        case .codex: return try ingestCodexFile(path: path, stamp: stamp, cursor: cursor, mode: .incremental)
-                        case .claude: return try ingestClaudeFile(path: path, stamp: stamp, cursor: cursor, mode: .incremental)
+                    try db.exec("SAVEPOINT ingest_file")
+                    let read: Int64
+                    let added: Int
+                    do {
+                        (read, added) = try autoreleasepool {
+                            let cursor = try source == .codex ? codexCursor(path: path, stamp: stamp) : loadCursor(path: path)
+                            switch source {
+                            case .codex: return try ingestCodexFile(path: path, stamp: stamp, cursor: cursor, mode: .incremental)
+                            case .claude: return try ingestClaudeFile(path: path, stamp: stamp, cursor: cursor, mode: .incremental)
+                            case .pi: return try ingestPiFile(path: path, stamp: stamp, cursor: cursor)
+                            case .gemini:
+                                let root = roots.first { path.hasPrefix($0.path + "/") }
+                                let id = root.map { String(path.dropFirst($0.path.count + 1)).components(separatedBy: "/").first ?? "" } ?? ""
+                                return try ingestGeminiFile(path: path, stamp: stamp, cursor: cursor, project: root.flatMap { maps[$0.path]?.projects[id] } ?? ProjectResolver.noProject)
+                            }
                         }
+                        try db.exec("RELEASE ingest_file")
+                    } catch let error as ZstdReader.Failure {
+                        try db.exec("ROLLBACK TO ingest_file; RELEASE ingest_file")
+                        NSLog("Tinybar: could not decode %@: %@", path, String(describing: error))
+                        continue
                     }
                     result.filesScanned += 1
                     result.bytesRead += read
@@ -432,7 +488,7 @@ public actor UsageStore {
         if mode != .incremental {
             guard let cursor else { return (0, 0) }
             until = limit ?? cursor.offset
-        } else if let cursor, cursor.stamp.inode == stamp.inode, stamp.size > cursor.stamp.size || stamp == cursor.stamp,
+        } else if !path.hasSuffix(".zst"), let cursor, cursor.stamp.inode == stamp.inode, stamp.size > cursor.stamp.size || stamp == cursor.stamp,
            let state = cursor.state, let decoded = try? JSONDecoder().decode(CodexLogParser.self, from: state)
         {
             parser = decoded
@@ -445,7 +501,7 @@ public actor UsageStore {
         var long: [AggKey: TokenCounts] = [:]
         var stats = StatBatch()
         var added = 0
-        let endOffset = try JSONLReader.forEachLine(url: url, from: offset, until: until) { line in
+        func consume(_ line: UnsafeRawBufferPointer) {
             let current = ModelName.normalize(parser.model ?? "unknown")
             let record = parser.consume(line: line) { if mode != .longContext { stats.add($0, provider: .codex, model: current) } }
             guard let record else { return }
@@ -455,11 +511,18 @@ public actor UsageStore {
                 stats.addResponse(day: day, provider: .codex, model: model, at: record.timestamp, tokens: record.tokens)
             }
             if mode != .backfill {
-                let key = AggKey(day: day, model: model, project: projects.project(for: record.cwd))
+                let key = AggKey(day: day, model: model, project: self.projects.project(for: record.cwd))
                 if mode == .incremental { agg[key, default: TokenCounts()] += record.tokens }
                 if let band = ContextBand.of(record.tokens) { long[key.band(band), default: TokenCounts()] += record.tokens }
             }
             added += 1
+        }
+
+        let endOffset: Int64
+        if path.hasSuffix(".jsonl.zst") {
+            endOffset = try ZstdReader.forEachLine(url: url, until: until, consume)
+        } else {
+            endOffset = try JSONLReader.forEachLine(url: url, from: offset, until: until, consume)
         }
 
         for (key, t) in agg {
@@ -477,6 +540,69 @@ public actor UsageStore {
             try saveCursor(path: path, source: .codex, stamp: stamp, offset: endOffset, state: state)
         }
         return (endOffset - offset, added)
+    }
+
+    private func ingestGeminiFile(path: String, stamp: FileStamp, cursor: Cursor?, project: String) throws -> (Int64, Int) {
+        var offset: Int64 = 0
+        if let cursor, cursor.stamp.inode == stamp.inode, stamp.size >= cursor.stamp.size {
+            offset = cursor.offset
+        }
+        let parser = AgyLogParser()
+        var entries: [AgyLogParser.Entry] = []
+        let end = try JSONLReader.forEachLine(url: URL(fileURLWithPath: path), from: offset) { line in
+            if let entry = parser.consume(line: line) { entries.append(entry) }
+        }
+        var stats = StatBatch()
+        for entry in entries {
+            let r = entry.record, day = DayKey.string(for: r.timestamp)
+            try addTokens(day: day, provider: .gemini, model: r.model, project: project, r.tokens)
+            stats.addResponse(day: day, provider: .gemini, model: r.model, at: r.timestamp, tokens: r.tokens)
+            for tool in entry.tools {
+                var values = tool.commandStats
+                values[StatKey.tool(tool.name), default: 0] += 1
+                stats.add(StatEvent(timestamp: r.timestamp, values: values), provider: .gemini, model: r.model)
+            }
+        }
+        try write(stats)
+        try saveCursor(path: path, source: .gemini, stamp: stamp, offset: end, state: nil)
+        return (end - offset, entries.count)
+    }
+
+    private func ingestPiFile(path: String, stamp: FileStamp, cursor: Cursor?) throws -> (Int64, Int) {
+        var parser = PiLogParser()
+        var offset: Int64 = 0
+        if let cursor, cursor.stamp.inode == stamp.inode, stamp.size > cursor.stamp.size || stamp == cursor.stamp,
+           let state = cursor.state, let decoded = try? JSONDecoder().decode(PiLogParser.self, from: state) {
+            parser = decoded
+            offset = cursor.offset
+        }
+        var entries: [PiLogParser.Entry] = []
+        let end = try JSONLReader.forEachLine(url: URL(fileURLWithPath: path), from: offset) { line in
+            if let entry = parser.consume(line: line) { entries.append(entry) }
+        }
+        var added = 0
+        var stats = StatBatch()
+        for entry in entries {
+            guard let provider = ProviderID(rawValue: entry.provider) else { continue }
+            let record = entry.record
+            let day = DayKey.string(for: record.timestamp)
+            let model = record.model
+            try db.run("INSERT OR IGNORE INTO pi_message (id, day, provider, model, context) VALUES (?, ?, ?, ?, ?)",
+                       [.text(entry.id), .text(day), .text(provider.rawValue), .text(model), .int(record.tokens.context)])
+            guard db.changes > 0 else { continue }
+            try addTokens(day: day, provider: provider, model: model, project: projects.project(for: record.cwd), record.tokens)
+            stats.addResponse(day: day, provider: provider, model: model, at: record.timestamp, tokens: record.tokens)
+            for tool in entry.tools {
+                var values = tool.commandStats
+                values[StatKey.tool(tool.name), default: 0] += 1
+                stats.add(StatEvent(timestamp: record.timestamp, values: values), provider: provider, model: model)
+            }
+            added += 1
+        }
+        try write(stats)
+        let state = (try? JSONEncoder().encode(parser)).map { String(decoding: $0, as: UTF8.self) }
+        try saveCursor(path: path, source: .pi, stamp: stamp, offset: end, state: state)
+        return (end - offset, added)
     }
 
     private func ingestClaudeFile(path: String, stamp: FileStamp, cursor: Cursor?, mode: ReadMode, limit: Int64? = nil) throws -> (Int64, Int) {
@@ -589,9 +715,12 @@ public actor UsageStore {
                 // A complete copy can carry less context than its preliminary line: drop the peak
                 // that line set to the largest of the day's other messages.
                 let others = try db.run("""
-                SELECT max(input + cache_write + cache_read) FROM claude_message
-                WHERE day = ? AND provider = ? AND model = ? AND id != ?
-                """, [.text(day), .text(provider.rawValue), .text(model), .text(id)]).first?.first?.int ?? 0
+                SELECT max(context) FROM (
+                    SELECT input + cache_write + cache_read AS context FROM claude_message
+                    WHERE day = ? AND provider = ? AND model = ? AND id != ?
+                    UNION ALL SELECT context FROM pi_message WHERE day = ? AND provider = ? AND model = ?
+                )
+                """, [.text(day), .text(provider.rawValue), .text(model), .text(id), .text(day), .text(provider.rawValue), .text(model)]).first?.first?.int ?? 0
                 try db.run("""
                 UPDATE daily_stat SET value = ? WHERE day = ? AND provider = ? AND model = ? AND key = ? AND value = ?
                 """, [.int(others), .text(day), .text(provider.rawValue), .text(model), .text(StatKey.contextMax), .int(old.context)])
@@ -626,6 +755,55 @@ public actor UsageStore {
         return true
     }
 
+    /// Imports remote Cursor activity. The watermark is committed only after every page succeeds.
+    public func syncCursorUsage(accessToken: String, now: Date = Date(),
+        fetch: @Sendable (Int64, Int64, Int) async throws -> CursorUsageEventsAPI.Response) async throws {
+        guard let sub = CursorAppAuth.jwtPayload(accessToken)?["sub"] as? String, !sub.isEmpty else {
+            throw ProviderError.notConfigured
+        }
+        let key = "cursor_usage_watermark:" + sub
+        let end = now.millis
+        let saved = try db.run("SELECT value FROM meta WHERE key = ?", [.text(key)]).first?.first?.text.flatMap(Int64.init)
+        let start = min(end, saved.map { $0 - 86_400_000 } ?? (end - 30 * 86_400_000))
+        var page = 1
+        var count = 0
+        while true {
+            try Task.checkCancellation()
+            let response = try await fetch(start, end, page)
+            try Task.checkCancellation()
+            let events = response.usageEventsDisplay ?? []
+            try db.transaction {
+                var stats = StatBatch()
+                for event in events {
+                    guard let id = event.usageEventId, !id.isEmpty, let timestamp = event.timestamp,
+                          timestamp.count == 13, let ms = Int64(timestamp) else { continue }
+                    try db.run("INSERT OR IGNORE INTO cursor_usage_event (id, timestamp_ms) VALUES (?, ?)", [.text(id), .int(ms)])
+                    guard db.changes > 0, let usage = event.tokenUsage else { continue }
+                    let tokens = TokenCounts(input: usage.inputTokens ?? 0, output: usage.outputTokens ?? 0,
+                                             cacheWrite: usage.cacheWriteTokens ?? 0, cacheRead: usage.cacheReadTokens ?? 0)
+                    guard tokens.total > 0 else { continue }
+                    let date = Date(timeIntervalSince1970: Double(ms) / 1000)
+                    let day = DayKey.string(for: date)
+                    let model = ModelName.normalize(event.model ?? "unknown")
+                    try addTokens(day: day, provider: .cursor, model: model, project: ProjectResolver.noProject, tokens)
+                    stats.addResponse(day: day, provider: .cursor, model: model, at: date, tokens: tokens)
+                }
+                try write(stats)
+            }
+            count += events.count
+            if events.isEmpty || (response.totalUsageEventsCount.map { count >= $0 } ?? (events.count < 200)) { break }
+            page += 1
+        }
+        try Task.checkCancellation()
+        try db.run("INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)", [.text(key), .text(String(end))])
+    }
+
+    public func syncCursorUsage(accessToken: String, now: Date = Date()) async throws {
+        try await syncCursorUsage(accessToken: accessToken, now: now) { start, end, page in
+            try await CursorUsageEventsAPI.fetch(accessToken: accessToken, startDate: start, endDate: end, page: page)
+        }
+    }
+
     // MARK: Activity stats
 
     private func write(_ batch: StatBatch) throws {
@@ -656,11 +834,12 @@ public actor UsageStore {
         SELECT path, provider, CAST(meta.value AS INTEGER) FROM file_cursor
         JOIN meta ON meta.key = 'stats_backfill_limit:' || path ORDER BY path
         """).compactMap { r -> (String, LogSource, Int64)? in
-            guard let path = r[0].text, let source = r[1].text.flatMap(LogSource.init(rawValue:)) else { return nil }
+            guard let path = r[0].text, let source = r[1].text.flatMap(LogSource.init(rawValue:)), (source == .codex || source == .claude) else { return nil }
             return (path, source, r[2].int)
         }
         var result = IngestResult(filesScanned: 0, bytesRead: 0, recordsAdded: 0)
         let batchSize = 200
+        var failed = false
         var index = 0
         while index < cursors.count {
             let batch = cursors[index..<min(index + batchSize, cursors.count)]
@@ -671,13 +850,22 @@ public actor UsageStore {
                     let checkpoint = "stats_backfill_file:" + path
                     guard try db.run("SELECT 1 FROM meta WHERE key = ?", [.text(checkpoint)]).isEmpty else { continue }
                     guard let cursor = try loadCursor(path: path), let stamp = Self.stamp(path),
-                          stamp.inode == cursor.stamp.inode, stamp.size >= cursor.offset
+                          Self.canBackfill(path: path, stamp: stamp, cursor: cursor, limit: limit)
                     else { continue }  // gone or replaced: the next ingest reads it from the start
-                    let (read, added) = try autoreleasepool {
-                        switch source {
-                        case .codex: try ingestCodexFile(path: path, stamp: stamp, cursor: cursor, mode: .backfill, limit: limit)
-                        case .claude: try ingestClaudeFile(path: path, stamp: stamp, cursor: cursor, mode: .backfill, limit: limit)
+                    let read: Int64
+                    let added: Int
+                    do {
+                        (read, added) = try autoreleasepool {
+                            switch source {
+                            case .codex: try ingestCodexFile(path: path, stamp: stamp, cursor: cursor, mode: .backfill, limit: limit)
+                            case .claude: try ingestClaudeFile(path: path, stamp: stamp, cursor: cursor, mode: .backfill, limit: limit)
+                            case .pi, .gemini: (0, 0) // never part of a legacy backfill
+                            }
                         }
+                    } catch let error as ZstdReader.Failure {
+                        NSLog("Tinybar: could not decode %@: %@", path, String(describing: error))
+                        failed = true
+                        continue
                     }
                     // Commit the checkpoint with its counters, so a restarted backfill cannot add them twice.
                     try db.run("INSERT INTO meta (key, value) VALUES (?, 'done')", [.text(checkpoint)])
@@ -691,7 +879,7 @@ public actor UsageStore {
             index += batch.count
             progress?(IngestProgress(filesDone: index, filesTotal: cursors.count))
         }
-        try markStatsBackfillDone()
+        if !failed { try markStatsBackfillDone() }
         if result.filesScanned > batchSize {
             try? db.exec("PRAGMA shrink_memory")
             malloc_zone_pressure_relief(nil, 0)
@@ -714,6 +902,7 @@ public actor UsageStore {
         """).compactMap { r -> (String, Int64)? in r[0].text.map { ($0, r[1].int) } }
         var result = IngestResult(filesScanned: 0, bytesRead: 0, recordsAdded: 0)
         let batchSize = 200
+        var failed = false
         var index = 0
         while index < paths.count {
             let batch = paths[index..<min(index + batchSize, paths.count)]
@@ -724,10 +913,18 @@ public actor UsageStore {
                     let checkpoint = "long_context_backfill_file:" + path
                     guard try db.run("SELECT 1 FROM meta WHERE key = ?", [.text(checkpoint)]).isEmpty else { continue }
                     guard let cursor = try loadCursor(path: path), let stamp = Self.stamp(path),
-                          stamp.inode == cursor.stamp.inode, stamp.size >= cursor.offset
+                          Self.canBackfill(path: path, stamp: stamp, cursor: cursor, limit: limit)
                     else { continue }
-                    let (read, added) = try autoreleasepool {
-                        try ingestCodexFile(path: path, stamp: stamp, cursor: cursor, mode: .longContext, limit: limit)
+                    let read: Int64
+                    let added: Int
+                    do {
+                        (read, added) = try autoreleasepool {
+                            try ingestCodexFile(path: path, stamp: stamp, cursor: cursor, mode: .longContext, limit: limit)
+                        }
+                    } catch let error as ZstdReader.Failure {
+                        NSLog("Tinybar: could not decode %@: %@", path, String(describing: error))
+                        failed = true
+                        continue
                     }
                     try db.run("INSERT INTO meta (key, value) VALUES (?, 'done')", [.text(checkpoint)])
                     result.filesScanned += 1
@@ -740,7 +937,7 @@ public actor UsageStore {
             index += batch.count
             progress?(IngestProgress(filesDone: index, filesTotal: paths.count))
         }
-        try markLongContextBackfillDone()
+        if !failed { try markLongContextBackfillDone() }
         if result.filesScanned > batchSize {
             try? db.exec("PRAGMA shrink_memory")
             malloc_zone_pressure_relief(nil, 0)
@@ -755,7 +952,7 @@ public actor UsageStore {
         try db.run("""
         INSERT OR IGNORE INTO meta (key, value)
         SELECT ? || path, CAST(offset AS TEXT) FROM file_cursor
-        """ + (codexOnly ? " WHERE provider = 'codex'" : ""), [.text(key + "_limit:")])
+        """ + (codexOnly ? " WHERE provider = 'codex'" : " WHERE provider IN ('codex', 'claude')"), [.text(key + "_limit:")])
         try db.run("INSERT INTO meta (key, value) VALUES (?, 'done')", [.text(key + "_bounds")])
     }
 
@@ -980,9 +1177,13 @@ public actor UsageStore {
 
     /// Every day with any tokens, oldest first: streaks span the whole history.
     /// Days with any usage, or with usage of one model, of the Providers Stats covers.
-    public func activeDays(model: String? = nil) throws -> [String] {
+    public func activeDays(model: String? = nil, provider: ProviderID? = nil) throws -> [String] {
         let covered = "provider IN (" + ProviderID.allCases.filter(\.hasActivity).map { "'\($0.rawValue)'" }.joined(separator: ", ") + ")"
         if let model {
+            if let provider {
+                return try db.run("SELECT DISTINCT day FROM daily_usage WHERE \(covered) AND model = ? AND provider = ? ORDER BY day", [.text(model), .text(provider.rawValue)])
+                    .compactMap { $0.first?.text }
+            }
             return try db.run("SELECT DISTINCT day FROM daily_usage WHERE \(covered) AND model = ? ORDER BY day", [.text(model)])
                 .compactMap { $0.first?.text }
         }
@@ -991,7 +1192,7 @@ public actor UsageStore {
 
     /// Log folders no import has read yet. A login folder or `cswap run` profile that appears can hold
     /// a whole history, so the app reads those in a child process, not during a normal ingest.
-    public func unreadLogRoots(_ roots: [URL] = UsageStore.codexRoots + UsageStore.claudeRoots) throws -> [URL] {
+    public func unreadLogRoots(_ roots: [URL] = UsageStore.codexRoots + UsageStore.claudeRoots + UsageStore.geminiRoots.filter { FileManager.default.fileExists(atPath: $0.path) }) throws -> [URL] {
         let read = try readLogRoots()
         return roots.filter { !read.contains($0.path) }
     }
@@ -1044,6 +1245,12 @@ public actor UsageStore {
         var state: Data?
     }
 
+    /// Compressed stamps measure encoded bytes, while backfill limits are decoded offsets.
+    private static func canBackfill(path: String, stamp: FileStamp, cursor: Cursor, limit: Int64) -> Bool {
+        guard stamp.inode == cursor.stamp.inode else { return false }
+        return path.hasSuffix(".jsonl.zst") ? stamp == cursor.stamp : stamp.size >= limit
+    }
+
     private struct AggKey: Hashable {
         var day: String
         var model: String
@@ -1062,7 +1269,9 @@ public actor UsageStore {
             guard root.lastPathComponent == "sessions" else { continue }
             let archive = root.deletingLastPathComponent().appendingPathComponent("archived_sessions")
             let file = archive.appendingPathComponent((path as NSString).lastPathComponent).path
-            if let stamp = Self.stamp(file) { _ = try codexCursor(path: file, stamp: stamp) }
+            for candidate in [path + ".zst", file, file + ".zst"] {
+                if let stamp = Self.stamp(candidate) { _ = try codexCursor(path: candidate, stamp: stamp); break }
+            }
         }
     }
 
@@ -1070,11 +1279,19 @@ public actor UsageStore {
     /// backfill bounds with it instead of importing the same session under a second path.
     private func codexCursor(path: String, stamp: FileStamp) throws -> Cursor? {
         if let cursor = try loadCursor(path: path) { return cursor }
-        guard let oldPath = try db.run("SELECT path FROM file_cursor WHERE provider = 'codex' AND inode = ?",
-                                       [.int(stamp.inode)]).compactMap({ $0[0].text }).first(where: {
-                                           ($0 as NSString).lastPathComponent == (path as NSString).lastPathComponent && Self.stamp($0) == nil
-                                       }),
-              let cursor = try loadCursor(path: oldPath) else { return nil }
+        let name = (path as NSString).lastPathComponent
+        let canonical = name.hasSuffix(".zst") ? String(name.dropLast(4)) : name
+        func home(_ path: String) -> String? {
+            let parts = path.split(separator: "/")
+            guard let i = parts.lastIndex(where: { $0 == "sessions" || $0 == "archived_sessions" }) else { return nil }
+            return "/" + parts[..<i].joined(separator: "/")
+        }
+        guard let oldPath = try db.run("SELECT path FROM file_cursor WHERE provider = 'codex'").compactMap({ $0[0].text }).first(where: {
+            let oldName = ($0 as NSString).lastPathComponent
+            let oldCanonical = oldName.hasSuffix(".zst") ? String(oldName.dropLast(4)) : oldName
+            return oldCanonical == canonical && home($0) != nil && home($0) == home(path)
+                && (Self.stamp($0) == nil || (path.hasSuffix(".zst") && !oldName.hasSuffix(".zst")))
+        }), let cursor = try loadCursor(path: oldPath) else { return nil }
         try db.run("UPDATE file_cursor SET path = ? WHERE path = ?", [.text(path), .text(oldPath)])
         for prefix in ["stats_backfill_limit:", "stats_backfill_file:", "long_context_backfill_limit:", "long_context_backfill_file:"] {
             try db.run("UPDATE meta SET key = ? WHERE key = ?", [.text(prefix + path), .text(prefix + oldPath)])
@@ -1094,7 +1311,7 @@ public actor UsageStore {
 
     /// Recursively visits `*.jsonl` files with one stat each, via fts(3): no Foundation
     /// objects per file, which matters with ~100k session files.
-    static func walkJSONL(_ root: String, _ visit: (String, FileStamp) throws -> Void) throws {
+    static func walkJSONL(_ root: String, source: LogSource = .claude, _ visit: (String, FileStamp) throws -> Void) throws {
         guard FileManager.default.fileExists(atPath: root) else { return }
         let rootC = strdup(root)
         defer { free(rootC) }
@@ -1103,15 +1320,26 @@ public actor UsageStore {
         defer { fts_close(fts) }
         while let entry = fts_read(fts) {
             let info = Int32(entry.pointee.fts_info)
-            if info == FTS_D, entry.pointee.fts_level > 0, String(cString: entry.pointee.fts_accpath).split(separator: "/").last?.hasPrefix(".") == true {  // skip hidden dirs
+            if info == FTS_D, entry.pointee.fts_level > 0, String(cString: entry.pointee.fts_accpath).split(separator: "/").last?.hasPrefix(".") == true,
+               !(source == .gemini && String(cString: entry.pointee.fts_accpath).split(separator: "/").last == ".system_generated") {  // skip hidden dirs
                 fts_set(fts, entry, FTS_SKIP)
                 continue
             }
             guard info == FTS_F, let st = entry.pointee.fts_statp?.pointee else { continue }
             let path = String(cString: entry.pointee.fts_path)
-            guard path.hasSuffix(".jsonl") else { continue }
+            guard acceptsLog(path, source: source) else { continue }
             try visit(path, FileStamp(st))
         }
+    }
+
+    static func acceptsLog(_ path: String, source: LogSource) -> Bool {
+        if source == .gemini {
+            let parts = path.split(separator: "/")
+            return parts.count >= 5 && parts.suffix(3).elementsEqual([".system_generated", "logs", "transcript.jsonl"])
+                && !parts[parts.count - 4].hasPrefix(".")
+        }
+        if path.split(separator: "/").contains(".system_generated") { return false }
+        return path.hasSuffix(".jsonl") || (source == .codex && (path as NSString).lastPathComponent.hasPrefix("rollout-") && path.hasSuffix(".jsonl.zst"))
     }
 
     static func stamp(_ path: String) -> FileStamp? {
@@ -1179,6 +1407,12 @@ enum JSONLReader {
             throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno))
         }
 
+        return try readLines(fd: fd, from: start, until: until, skipping: skipping, body)
+    }
+
+    static func readLines(fd: Int32, from start: Int64, until: Int64? = nil, skipping initialSkipping: Bool = false,
+                          drain: Bool = false, _ body: (UnsafeRawBufferPointer) -> Void) throws -> Int64 {
+        var skipping = initialSkipping
         let capacity = chunkSize + maxLineBytes
         let buf = UnsafeMutableRawPointer.allocate(byteCount: capacity, alignment: 1)
         defer { buf.deallocate() }
@@ -1223,6 +1457,14 @@ enum JSONLReader {
             } else {
                 if rest > 0, lineStart > 0 { memmove(buf, buf + lineStart, rest) }
                 filled = rest
+            }
+        }
+        if drain && reachedLimit {
+            while true {
+                let n = read(fd, buf, capacity)
+                if n < 0 && errno == EINTR { continue }
+                if n < 0 { throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno)) }
+                if n == 0 { break }
             }
         }
         return consumedOffset

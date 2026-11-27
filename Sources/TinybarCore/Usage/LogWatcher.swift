@@ -91,7 +91,7 @@ public final class LogWatcher: @unchecked Sendable {
             else { continue }
             if f & kFSEventStreamEventFlagItemIsDir != 0 {
                 state.needsFullScan = true
-            } else if path.hasSuffix(".jsonl") {
+            } else if UsageStore.LogSource.allCases.contains(where: { UsageStore.acceptsLog(path, source: $0) }) {
                 state.pending.insert(path)
             }
         }
